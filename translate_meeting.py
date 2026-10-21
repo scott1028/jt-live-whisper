@@ -497,6 +497,27 @@ def _str_display_width(s):
     return w
 
 
+def _wrap_display(text, width):
+    """Hard-wrap text by display width (same column rule as _str_display_width:
+    CJK/fullwidth = 2 columns), like the terminal's auto-wrap of final subtitles.
+    Returns a list of lines each at most width wide; a double-width char is
+    never split, so a char wider than width gets its own line. '' -> []."""
+    lines = []
+    cur = ""
+    w = 0
+    for c in text:
+        cw = _str_display_width(c)
+        if cur and w + cw > width:
+            lines.append(cur)
+            cur = ""
+            w = 0
+        cur += c
+        w += cw
+    if cur:
+        lines.append(cur)
+    return lines
+
+
 def _print_with_badge(text, badge_color, elapsed, label=""):
     """輸出翻譯文字 + 速度 badge，避免 badge 換行導致背景色延伸整行。
     可透過 config.json 設定隱藏：hide_asr_time (辨識) / hide_translate_time (翻譯)"""
@@ -2717,6 +2738,11 @@ SCENE_PRESETS = [
     ("演講簡報", 12000, 4000, "長段演講，內容完整度優先（12秒）"),
     ("快速字幕", 3000, 2000, "最低延遲，適合即時展示（3秒）"),
 ]
+
+# streaming ASR (_StreamingASR) timing constants
+_LA_MIN_CHUNK_SEC = 1.0      # new audio that triggers one recognition round
+_LA_TRIM_SEC = 15.0          # start segment-trimming the audio buffer past this (s)
+_LA_IDLE_FLUSH_SEC = 1.5     # flush the assembling sentence after no commit for this long (s)
 
 # Moonshine 串流模型（僅英文）
 MOONSHINE_MODELS = [
@@ -5238,6 +5264,32 @@ class ArgosTranslator:
         return _s2twp_safe(" ".join(translated_parts))
 
 
+def _chunk_for_nllb(piece, max_chars):
+    """Expand a punctuation-split piece into <= max_chars translation chunks:
+    at word boundaries when it has spaces (each chunk whole words); a
+    space-free run longer than max_chars is sliced. NLLB drops the tail of
+    over-long inputs, so it must never receive a piece over max_chars."""
+    if len(piece) <= max_chars:
+        return [piece]
+    if " " not in piece:
+        return [piece[i:i + max_chars] for i in range(0, len(piece), max_chars)]
+    chunks = []
+    cur = ""
+    for w in piece.split(" "):
+        cand = w if not cur else cur + " " + w
+        if cur and len(cand) > max_chars:
+            chunks.append(cur)
+            cur = w
+        else:
+            cur = cand
+    if cur:
+        chunks.append(cur)
+    # one word alone can still exceed max_chars: slice it so no chunk is too long
+    return [c for c in chunks for c in
+            ([c] if len(c) <= max_chars
+             else [c[i:i + max_chars] for i in range(0, len(c), max_chars)])]
+
+
 class NllbTranslator:
     """使用 NLLB 600M (CTranslate2) 離線多語言翻譯"""
 
@@ -5263,7 +5315,9 @@ class NllbTranslator:
             sys.exit(1)
         src_key, tgt_key = self._DIRECTION_MAP.get(direction, ("en", "zh"))
         self.src_lang = self._LANG_MAP[src_key]
-        self.tgt_lang = self._LANG_MAP[tgt_key]
+        # NLLB zho_Hant often stops after the first comma; zho_Hans translates
+        # fully and _s2twp_safe() (in translate()) converts back to Traditional
+        self.tgt_lang = "zho_Hans" if tgt_key == "zh" else self._LANG_MAP[tgt_key]
         self.direction = direction
         print(f"{C_DIM}正在載入 NLLB 離線翻譯模型...{RESET}", end=" ", flush=True)
         _webui_send({"type": "progress", "stage": "載入中", "detail": "NLLB 離線翻譯模型"})
@@ -5281,9 +5335,19 @@ class NllbTranslator:
         try:
             self.sp = sentencepiece.SentencePieceProcessor()
             self.sp.Load(os.path.join(NLLB_MODEL_DIR, "sentencepiece.bpe.model"))
-            self.ct2 = ctranslate2.Translator(
-                NLLB_MODEL_DIR, device="cpu", compute_type="int8"
-            )
+            dev_kw = _fw_device_kwargs()
+            try:
+                self.ct2 = ctranslate2.Translator(NLLB_MODEL_DIR, **dev_kw)
+                self._translate_short("Hello.")     # warm-up: CUDA errors show up here
+            except Exception as e:
+                if dev_kw.get("device") != "cuda" or not _fw_is_cuda_error(e):
+                    raise
+                msg = (str(e).strip().splitlines() or [type(e).__name__])[0][:160]
+                print(f"\n  {C_DIM}NLLB 翻譯：顯示卡不能用（{msg}），改用 CPU（較慢）。{RESET}", flush=True)
+                self.ct2 = ctranslate2.Translator(
+                    NLLB_MODEL_DIR, device="cpu", compute_type="int8"
+                )
+                self._translate_short("Hello.")
             print(f"{C_OK}{BOLD}完成！{RESET}")
         except Exception as e:
             print(f"\n{C_HIGHLIGHT}[錯誤] NLLB 模型載入失敗: {e}{RESET}", file=sys.stderr)
@@ -5303,9 +5367,19 @@ class NllbTranslator:
             beam_size=5,
             no_repeat_ngram_size=4,
             max_decoding_length=256,
+            # NLLB 600M stops at the first comma and drops the source tail when
+            # translating to Chinese; keep the default 0.0 for other targets
+            coverage_penalty=1.0 if self.tgt_lang == "zho_Hans" else 0.0,
         )
         output_tokens = results[0].hypotheses[0][1:]  # skip lang token
-        return self.sp.Decode(output_tokens)
+        text = self.sp.Decode(output_tokens)
+        if "⁇" in text:
+            import re
+            # 夾/夹 not in NLLB sentencepiece vocab → ⁇; restore after common words
+            # (zho_Hans "文件夹" → s2twp "資料夾"); drop any other ⁇ and tidy spaces
+            text = re.sub(r"(文件|资料|档案|文档)\s*⁇\s*", r"\1夹", text)
+            text = re.sub(r"\s+", " ", text.replace("⁇", "")).strip()
+        return text
 
     _has_repetition = staticmethod(ArgosTranslator._has_repetition)
 
@@ -5314,9 +5388,12 @@ class NllbTranslator:
         if not text:
             return ""
         import re
-        sentences = re.split(r'(?<=[.!?,;。！？，；])\s*', text)
-        translated_parts = []
         max_chars = 80
+        # long unpunctuated pieces make NLLB drop the tail: expand them into
+        # <= max_chars chunks before the grouping loop
+        sentences = [p for s in re.split(r'(?<=[.!?,;。！？，；])\s*', text)
+                     for p in _chunk_for_nllb(s, max_chars)]
+        translated_parts = []
         buf = ""
         for sent in sentences:
             if buf and len(buf) + len(sent) > max_chars:
@@ -5329,10 +5406,10 @@ class NllbTranslator:
         if buf:
             part = self._translate_short(buf)
             if self._has_repetition(part):
-                for s in re.split(r'(?<=[.!?,;。！？，；])\s*', buf):
-                    s = s.strip()
-                    if not s:
-                        continue
+                # same expansion in the repetition-retry path
+                retry = [p for s in re.split(r'(?<=[.!?,;。！？，；])\s*', buf)
+                         for p in _chunk_for_nllb(s.strip(), max_chars) if p]
+                for s in retry:
                     p = self._translate_short(s)
                     if not self._has_repetition(p):
                         translated_parts.append(p)
@@ -8958,6 +9035,175 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     _cleanup_remote()
 
 
+class _StreamingASR:
+    """LocalAgreement-2 streaming ASR buffer (Macháček et al. 2023, arXiv:2307.14743;
+    ported from ufal/whisper_streaming's HypothesisBuffer + OnlineASRProcessor).
+
+    transcribe(audio_f32_mono, prompt_or_None) -> (words, seg_ends):
+      words = [(start, end, text)], seconds relative to the buffer start (faster-whisper
+      word timestamps; English text carries its leading space, so text is joined with "");
+      seg_ends = segment end seconds, same frame.
+    A word is committed only when two consecutive hypotheses agree on it (exact stripped
+    text, so punctuation must match); committed words are assembled into sentences here.
+    numpy / time are imported inside the methods on purpose (module-level np only exists
+    when Moonshine is installed, issue #6)."""
+
+    _SENT_END = (".", "?", "!", "。", "？", "！")
+    _COMMA_END = (",", "，", "、", ";", "；")
+    _ABBREV = {"mr.", "mrs.", "ms.", "dr.", "st.", "vs.", "e.g.", "i.e.", "u.s."}
+    _SOFT_CAP = (80, 40)     # emit on a comma past this many chars: (latin, cjk)
+    _HARD_CAP = (120, 60)    # emit unconditionally past this many chars
+    _HISTORY_MAX = 1000      # prompt uses the last 200 chars; keep some slack
+
+    def __init__(self, samplerate, transcribe, cjk=False, prompt_prefix=""):
+        import numpy as np
+        self.samplerate = samplerate
+        self.transcribe = transcribe
+        self.cjk = cjk
+        self.prompt_prefix = prompt_prefix
+        self.buffer = np.zeros(0, dtype=np.float32)   # audio of [offset, audio_end)
+        self.offset = 0.0          # absolute seconds of buffer[0]
+        self.audio_end = 0.0       # absolute seconds of all audio received
+        self.in_buffer = []        # committed (start, end, text) still inside buffer
+        self.prev = []             # previous hypothesis, not yet agreed on
+        self.last_end = 0.0        # absolute end time of the last committed word
+        self.history = ""          # committed text cut out of the buffer (prompt feed)
+        self.sentence = []         # word texts of the sentence being assembled
+        self.last_commit_at = 0.0  # audio_end when a word was last committed
+        self._last_proc_end = 0.0  # audio_end at the previous process()
+
+    def insert_audio(self, chunk):
+        import numpy as np
+        chunk = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        self.buffer = np.concatenate([self.buffer, chunk])
+        self.audio_end += chunk.shape[0] / self.samplerate
+
+    @property
+    def pending_sec(self):
+        """seconds of audio added since the last process()"""
+        return self.audio_end - self._last_proc_end
+
+    def process(self):
+        """Transcribe the buffer once; return (sentences, proc_time)."""
+        import numpy as np
+        import time
+        self._last_proc_end = self.audio_end
+        sentences = []
+        if self.buffer.shape[0] == 0:
+            return sentences, 0.0
+        rms = float(np.sqrt(np.mean(self.buffer ** 2)))
+        t0 = time.monotonic()
+        seg_ends = []
+        recognized = False
+        if rms >= 0.001:
+            prompt = (self.prompt_prefix + " " + self.history[-200:]).strip() or None
+            words, seg_ends = self.transcribe(self.buffer, prompt)
+            recognized = bool(words)
+            if words:                          # empty result: keep prev (whisper_streaming)
+                self._merge(words, sentences)
+            proc_time = time.monotonic() - t0
+        else:
+            proc_time = 0.0                    # silence: no point transcribing
+        self._trim(seg_ends, recognized)
+        if self.sentence:
+            gap = self.audio_end - self.last_commit_at
+            # flush early only when nothing is pending agreement; with prev words
+            # a 1x gap is normal commit cadence and would fragment the sentence
+            if ((not self.prev and gap >= _LA_IDLE_FLUSH_SEC)
+                    or gap >= 3 * _LA_IDLE_FLUSH_SEC):
+                sentences.append("".join(self.sentence).strip())
+                self.sentence = []
+        return sentences, proc_time
+
+    def partial_text(self):
+        """Raw (stable, tentative) text: the sentence being assembled and the
+        uncommitted hypothesis. Read-only, does not change any state."""
+        return "".join(self.sentence), "".join(w[2] for w in self.prev)
+
+    def _merge(self, words, sentences):
+        """Absolute times, drop re-heard words, commit the agreed prefix."""
+        new = [(s + self.offset, e + self.offset, t) for s, e, t in words]
+        new = [w for w in new if w[0] > self.last_end - 0.1]
+        if self.in_buffer and new and new[0][0] <= self.last_end + 0.2:
+            # only de-dupe when the hypothesis re-hears the audio around last_end
+            # (timestamp jitter <= 0.2 s); a genuine repetition starts later and
+            # must survive (endgame_nagg_nell.wav repeats whole lines by design)
+            old = [w[2].strip() for w in self.in_buffer]
+            head = [w[2].strip() for w in new]
+            for n in range(min(5, len(old), len(head)), 0, -1):
+                if old[-n:] == head[:n]:
+                    new = new[n:]
+                    break
+        agreed = 0
+        while (agreed < len(self.prev) and agreed < len(new)
+               and self.prev[agreed][2].strip() == new[agreed][2].strip()):
+            agreed += 1
+        committed, self.prev = new[:agreed], new[agreed:]
+        if committed:
+            self.in_buffer += committed
+            self.last_end = committed[-1][1]
+            self.last_commit_at = self.audio_end
+            self._assemble(committed, sentences)
+
+    def _assemble(self, words, sentences):
+        """Append committed words to the sentence; emit on .end / long comma / hard cap."""
+        i = 1 if self.cjk else 0
+        soft, hard = self._SOFT_CAP[i], self._HARD_CAP[i]
+        for w in words:
+            self.sentence.append(w[2])
+            text = "".join(self.sentence).strip()
+            token = w[2].strip().lower()
+            ends_sentence = (token.endswith(self._SENT_END)
+                             and token not in self._ABBREV)
+            long_comma = len(text) >= soft and token.endswith(self._COMMA_END)
+            if ends_sentence or long_comma or len(text) >= hard:
+                sentences.append(text)
+                self.sentence = []
+
+    def _trim(self, seg_ends, recognized):
+        """Keep the buffer bounded; committed text leaving the buffer goes to history."""
+        buf_dur = self.audio_end - self.offset
+        cut = None
+        if buf_dur > _LA_TRIM_SEC:
+            done = [self.offset + e for e in seg_ends if self.offset + e <= self.last_end]
+            if len(done) >= 2:
+                cut = done[-2]                 # second-to-last completed segment end
+        if cut is None and buf_dur > 25.0:
+            cut = self.last_end if self.last_end > self.offset else self.audio_end - 5.0
+        if cut is None and not recognized and buf_dur > 5.0:
+            cut = self.audio_end - 1.0         # nothing recognised: keep only last 1 s
+        if cut is None or cut <= self.offset:
+            return
+        drop = min(int((cut - self.offset) * self.samplerate), self.buffer.shape[0])
+        self.buffer = self.buffer[drop:]
+        self.offset += drop / self.samplerate
+        keep = []
+        for w in self.in_buffer:
+            if w[1] <= cut:
+                self.history += w[2]
+            else:
+                keep.append(w)
+        self.in_buffer = keep
+        self.history = self.history[-self._HISTORY_MAX:]
+
+    def finish(self):
+        """Emit the assembling sentence plus the uncommitted hypothesis as one
+        line, then reset the buffer (history is kept for the prompt)."""
+        text = "".join(self.sentence) + "".join(w[2] for w in self.prev)
+        out = [text.strip()] if text.strip() else []
+        # every committed sentence word is in in_buffer or already in history:
+        # appending the in_buffer text keeps the prompt context without duplicates
+        self.history += "".join(w[2] for w in self.in_buffer)
+        self.history = self.history[-self._HISTORY_MAX:]
+        self.sentence = []
+        self.prev = []
+        self.in_buffer = []
+        self.buffer = self.buffer[0:0]
+        self.offset = self.audio_end
+        self._last_proc_end = self.audio_end
+        return out
+
+
 @_keep_awake_during
 def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                              mode: str = "en2zh",
@@ -8976,6 +9222,11 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         _fw_av_compat()
 
     whisper_lang = _mode_whisper_lang(mode)
+
+    # LocalAgreement-2 streaming flow: faster-whisper only.
+    # TODO: Breeze-ASR-26 has no word timestamps; evaluate mlx-whisper for the
+    #       streaming flow later (no test device on Linux) - both keep the 8s/3s flow
+    use_la = (not use_mlx) and not _is_nan_mode(mode)
 
     # ── 翻譯記錄檔 ──
     from datetime import datetime
@@ -9108,6 +9359,25 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             print(f"  {C_OK}模型下載完成（{time.monotonic() - t0:.1f}s）{RESET}")
         else:
             print(f" {C_OK}完成（{time.monotonic() - t0:.1f}s）{RESET}")
+        if use_la:
+            # warm-up: ~2 s low-level noise (silence + VAD would skip the decoder);
+            # compiles the kernels and forces _FwModel's CPU fallback before real audio
+            try:
+                import tempfile as _tf
+                _wu_fd, _wu_path = _tf.mkstemp(suffix=".wav")
+                os.close(_wu_fd)
+                _wu = (np.random.uniform(-1.0, 1.0, 32000) * 0.002).astype(np.float32)
+                with wave.open(_wu_path, "wb") as _wf:
+                    _wf.setnchannels(1)
+                    _wf.setsampwidth(2)
+                    _wf.setframerate(16000)
+                    _wf.writeframes((_wu * 32767).astype(np.int16).tobytes())
+                _wu_segs, _ = fw_model.transcribe(_wu_path, beam_size=5, vad_filter=False,
+                                                  word_timestamps=True)
+                list(_wu_segs)
+                os.unlink(_wu_path)
+            except Exception:
+                pass
 
     # ── 音訊裝置 ──
     import sounddevice as sd
@@ -9189,7 +9459,10 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             print(f"  {C_OK}翻譯引擎: NLLB 本機離線{RESET}")
         elif isinstance(translator, ArgosTranslator):
             print(f"  {C_OK}翻譯引擎: Argos 本機離線{RESET}")
-    print(f"  {C_WHITE}音訊緩衝: {length_ms}ms / 步進 {step_ms}ms{RESET}")
+    if use_la:
+        print(f"  {C_WHITE}串流辨識: 每 {_LA_MIN_CHUNK_SEC:.1f} 秒確認，緩衝上限 {_LA_TRIM_SEC:.0f} 秒{RESET}")
+    else:
+        print(f"  {C_WHITE}音訊緩衝: {length_ms}ms / 步進 {step_ms}ms{RESET}")
     print(f"  {C_DIM}翻譯記錄: logs/{log_filename}{RESET}")
     if recorder:
         print(f"  {C_DIM}錄音: {recorder.path}{RESET}")
@@ -9207,6 +9480,10 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     ring_write_pos = 0
     ring_filled = 0
     ring_lock = threading.Lock()
+
+    # streaming flow: raw mono chunks queued here, consumed by la_worker
+    _la_chunks = []
+    _la_chunk_lock = threading.Lock()
 
     pause_event = threading.Event()
     global _webui_pause_event; _webui_pause_event = pause_event
@@ -9243,6 +9520,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 ring_buffer[:n - first] = audio[first:]
             ring_write_pos = (ring_write_pos + n) % ring_size
             ring_filled += n
+        if use_la:
+            with _la_chunk_lock:
+                _la_chunks.append(audio)    # astype() already made a private copy
 
     import sounddevice as sd
     sd_stream = _open_capture_stream(
@@ -9346,12 +9626,18 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                     break
                 _trans_next[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
+            if use_la:                 # shown or filtered: the sentence
+                with _la_disp_lock:    # leaves the interim caption either way
+                    if src_text in _la_awaiting:
+                        _la_awaiting.remove(src_text)
             if not result:
                 if not isinstance(result, _TranslateFailed):
                     continue                     # 被過濾掉的翻譯（幻覺、亂碼）：照舊整筆略過
                 result = "（翻譯失敗）"           # 出錯：原文照樣顯示（以前連原文都不見）
             src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
             with print_lock:
+                if use_la:
+                    _la_clear_line()
                 # 原文 + 辨識耗時
                 _print_with_badge(f"{src_color}[{src_label}] {src_text}{RESET}",
                                   C_BADGE_ASR, asr_elapsed, "辨")
@@ -9371,6 +9657,10 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                          "asr_time": round(asr_elapsed, 1),
                          "translate_time": round(elapsed, 1),
                          "timestamp": timestamp})
+            if use_la:
+                # redraw after the transcription event (see emit_line): the WebUI
+                # must see the final before the partial that drops the sentence
+                la_show_partial()
 
     def translate_and_print(seq, src_text, _log_path, asr_elapsed=0):
         t0 = time.monotonic()
@@ -9452,6 +9742,96 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         hallucination_check = _is_zh_hallucination
     src_color, src_label = _MODE_LABELS[mode][0], _MODE_LABELS[mode][1]
 
+    # ── 灰色暫時字幕（只在新流程 use_la 顯示，這裡的函式兩流程共用）──
+    _la_awaiting = []          # sentences sent to translation, not yet displayed
+    _la_partial = ["", ""]     # worker snapshot: (stable, tentative)
+    _la_shown = [0]            # interim caption lines currently on screen
+    _la_ws_pair = [None]       # last (stable, tentative) pushed to WebUI
+    _la_disp_lock = threading.Lock()
+    _la_show_lock = threading.Lock()   # serializes full redraws (worker + translate threads)
+
+    def _la_clear_line():
+        """Erase all interim caption lines if shown (caller holds print_lock).
+        Erases upward line by line (\\r\\033[K + \\033[A) so the cursor ends at
+        the start of the first partial line, where the next final prints.
+        Never \\033[J: it would erase the bottom status bar too."""
+        if _la_shown[0]:
+            print("\r\033[K" + "\033[A\r\033[K" * (_la_shown[0] - 1),
+                  end="", flush=True)
+            _la_shown[0] = 0
+
+    def la_show_partial():
+        """Redraw the grey interim caption and push a WebUI partial event on
+        change. The whole body is serialized so an older snapshot can never
+        print or send after a newer one. Callers must NOT hold print_lock or
+        _la_disp_lock; print_lock is taken here only around the print."""
+        with _la_show_lock:
+            with _la_disp_lock:
+                awaiting = list(_la_awaiting)
+                stable, tentative = _la_partial
+            sep = "" if mode in _ZH_INPUT_MODES + _JA_INPUT_MODES else " "
+            # zh/ja join without spaces; ko/en raw word texts carry leading
+            # spaces, strip each part so there is exactly one space between
+            parts = [x.strip() for x in (*awaiting, stable, tentative) if x.strip()]
+            text = sep.join(parts)
+            # WebUI stable also carries the awaiting sentences: a committed
+            # sentence must not vanish from the page while its translation is
+            # pending
+            ws_stable = sep.join(x.strip() for x in (*awaiting, stable) if x.strip())
+            if mode in _ZH_INPUT_MODES:    # display copies only, s2twp once each
+                                           # (ja/ko finals are never converted)
+                text = _s2twp_safe(text)
+                ws_stable = _s2twp_safe(ws_stable)
+                tentative = _s2twp_safe(tentative)
+            if text:
+                cols, rows = shutil.get_terminal_size((80, 24))
+                lines = _wrap_display("[...] " + text, cols - 1)
+                keep = max(1, rows - 3)
+                if len(lines) > keep:
+                    lines = lines[-keep:]    # keep the newest tail lines
+                with print_lock:
+                    _la_clear_line()         # erase the previous block first
+                    print("\r" + C_DIM + "\n".join(lines) + RESET,
+                          end="", flush=True)
+                    _la_shown[0] = len(lines)
+            else:
+                with print_lock:
+                    _la_clear_line()
+            pair = (ws_stable, tentative)
+            if pair != _la_ws_pair[0]:
+                _la_ws_pair[0] = pair
+                _webui_send({"type": "partial", "source": "main", "src_lang": src_label,
+                             "stable": pair[0], "tentative": pair[1]})
+
+    def emit_line(line, proc_time):
+        """Shared emit tail for both flows: async translation or direct
+        print + log + WebUI. Callers apply s2twp / filters themselves."""
+        if mode in _TRANSLATE_MODES and translator:
+            seq = _trans_seq[0]; _trans_seq[0] += 1
+            threading.Thread(
+                target=translate_and_print,
+                args=(seq, line, log_path, proc_time),
+                daemon=True,
+            ).start()
+        else:
+            with print_lock:
+                if use_la:
+                    _la_clear_line()
+                print(f"{src_color}{BOLD}[{src_label}] {line}{RESET}", flush=True)
+                print(flush=True)
+                _status_bar_state["count"] += 1
+                refresh_status_bar()
+            timestamp = time.strftime("%H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(f"[{timestamp}] [{src_label}] {line}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": line,
+                         "asr_time": round(proc_time, 1), "timestamp": timestamp})
+            if use_la:
+                # redraw only after the transcription event, so the WebUI never
+                # drops the sentence from the partial before its final arrives
+                la_show_partial()
+
     def drain_ordered_results():
         _NOT_READY = object()
         while True:
@@ -9483,25 +9863,113 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 if is_duplicate(line):
                     continue
                 recent_texts.append(line.lower().strip())
-                if mode in _TRANSLATE_MODES and translator:
-                    seq = _trans_seq[0]; _trans_seq[0] += 1
-                    threading.Thread(
-                        target=translate_and_print,
-                        args=(seq, line, log_path, proc_time),
-                        daemon=True,
-                    ).start()
-                else:
+                emit_line(line, proc_time)
+
+    # ── LocalAgreement-2 串流辨識 ──
+    la_asr = None
+    la_thread = None
+    if use_la:
+        _la_prompt_ok = model_name in _PROMPT_CAPABLE_MODELS
+
+        def la_transcribe(audio, prompt):
+            """_StreamingASR transcribe fn: denoise -> native-rate WAV -> fw words"""
+            ordered = _denoise(audio, sd_samplerate)
+            pcm = (ordered * 32767).clip(-32768, 32767).astype(np.int16)
+            _fw_wav_seq[0] += 1
+            tmp_path = os.path.join(_tmp_wav_dir, f"jt_fw_{os.getpid()}_{_fw_wav_seq[0]}.wav")
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sd_samplerate)
+                wf.writeframes(pcm.tobytes())
+            try:
+                segs_iter, _info = fw_model.transcribe(
+                    tmp_path, language=whisper_lang, beam_size=5, vad_filter=True,
+                    word_timestamps=True, condition_on_previous_text=False,
+                    initial_prompt=prompt if _la_prompt_ok else None)
+                words, seg_ends = [], []
+                for seg in segs_iter:
+                    for wd in (seg.words or []):
+                        if wd.word.strip():
+                            words.append((wd.start, wd.end, wd.word))
+                    seg_ends.append(seg.end)
+                return words, seg_ends
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        la_asr = _StreamingASR(
+            sd_samplerate, la_transcribe,
+            cjk=mode in _ZH_INPUT_MODES + _JA_INPUT_MODES + _KO_INPUT_MODES,
+            prompt_prefix=meeting_topic or "")
+
+        _la_slow_warned = [False]
+
+        def la_emit(line, proc_time):
+            """New-flow per-line filters, then the shared tail. s2twp is NOT
+            idempotent, so it must run exactly once per line in each flow."""
+            if mode in _ZH_INPUT_MODES:
+                line = _s2twp_safe(line)
+            if hallucination_check(line):
+                return
+            if mode in _TRANSLATE_MODES and translator:
+                # shown until _drain_translations displays/filters it
+                # (condition must match emit_line's translation branch)
+                with _la_disp_lock:
+                    _la_awaiting.append(line)
+            emit_line(line, proc_time)
+
+        def la_worker():
+            _paused = False
+            while not stop_event.is_set():
+                try:
+                    if pause_event.is_set():
+                        with _la_chunk_lock:
+                            del _la_chunks[:]
+                        if not _paused:            # flush the tail once per pause
+                            _paused = True
+                            for la_line in la_asr.finish():
+                                la_emit(la_line, 0.0)
+                            with _la_disp_lock:    # interim caption clears after flush
+                                _la_partial[:] = ["", ""]
+                            la_show_partial()
+                        time.sleep(0.05)
+                        continue
+                    _paused = False
+                    with _la_chunk_lock:
+                        chunks, _la_chunks[:] = _la_chunks[:], []
+                    if not chunks:
+                        time.sleep(0.05)           # never sleep holding the lock:
+                        continue                   # audio_callback waits on it (parec xruns)
+                    for c in chunks:
+                        la_asr.insert_audio(c)
+                    if la_asr.pending_sec < _LA_MIN_CHUNK_SEC:
+                        continue
+                    sentences, proc_time = la_asr.process()
+                    with _la_disp_lock:            # snapshot for other threads' redraws
+                        _la_partial[:] = list(la_asr.partial_text())
+                    for la_line in sentences:
+                        la_emit(la_line, proc_time)
+                    la_show_partial()
+                    if not _la_slow_warned[0] and proc_time > 3.0:
+                        _la_slow_warned[0] = True
+                        _rec = _recommended_whisper_model(mode)
+                        if _rec != model_name:
+                            with print_lock:
+                                _la_clear_line()
+                                print(f"\n  {C_WARN}[提示] 辨識耗時 {proc_time:.1f}s，建議改用 {_rec}（此裝置適合）{RESET}", flush=True)
+                                print(f"  {C_DIM}下次啟動可用 -m {_rec} 參數{RESET}\n", flush=True)
+                            la_show_partial()
+                except Exception as e:
                     with print_lock:
-                        print(f"{src_color}{BOLD}[{src_label}] {line}{RESET}", flush=True)
-                        print(flush=True)
-                        _status_bar_state["count"] += 1
-                        refresh_status_bar()
-                    timestamp = time.strftime("%H:%M:%S")
-                    with open(log_path, "a", encoding="utf-8") as log_f:
-                        log_f.write(f"[{timestamp}] [{src_label}] {line}\n\n")
-                    _webui_send({"type": "transcription", "source": "main",
-                                 "src_lang": src_label, "src_text": line,
-                                 "asr_time": round(proc_time, 1), "timestamp": timestamp})
+                        _la_clear_line()
+                        print(f"{C_DIM}  [本機辨識失敗: {e}]{RESET}", flush=True)
+                    la_show_partial()
+                    time.sleep(0.2)
+
+        la_thread = threading.Thread(target=la_worker, daemon=True)
 
     # ── 清理 ──
     _cleaned_up = [False]
@@ -9598,6 +10066,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         signal.signal(signal.SIGWINCH, _handle_sigwinch)
 
     # ── 主迴圈 ──
+    if la_thread:
+        la_thread.start()
     step_sec = step_ms / 1000.0
     length_samples = ring_size
     next_transcribe_time = time.monotonic() + (length_ms / 1000.0)
@@ -9607,6 +10077,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             if _status_bar_active:
                 with print_lock:
                     refresh_status_bar()
+            if use_la:
+                continue        # streaming worker handles recognition and emit
             now = time.monotonic()
             if pause_event.is_set():
                 next_transcribe_time = now + step_sec

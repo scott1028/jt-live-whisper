@@ -142,6 +142,9 @@ body:not(.has-live){overflow:auto}
 .msgs{scroll-behavior:smooth}
 .m{max-width:78%;padding:10px 16px;border-radius:12px;font-size:15px;line-height:1.6;word-wrap:break-word;animation:msgIn .4s ease;transform-origin:bottom}
 .m.o{align-self:flex-start;background:var(--bg-other);border-left:3px solid var(--text-src)}
+.m.pm{opacity:.8}
+.m.pm .pm-s{color:var(--text-dim)}
+.m.pm .pm-t{color:var(--text-dim);opacity:.6;font-style:italic}
 .m.s{align-self:flex-end;background:var(--bg-self);border-right:3px solid var(--text-dst)}
 @keyframes msgIn{from{opacity:0}to{opacity:1}}
 .m-lang{display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;padding:0;border-radius:4px;margin-right:6px;vertical-align:middle;letter-spacing:.3px;min-width:32px;height:22px;text-align:center}
@@ -165,6 +168,9 @@ body:not(.has-live){overflow:auto}
 .sub-mode .msgs{justify-content:flex-end;padding:0 5% 30px;gap:6px;background:#000}
 .sub-mode .m{max-width:100%!important;background:transparent!important;border:none!important;border-left:none!important;border-right:none!important;box-shadow:none!important;padding:4px 0;border-radius:0!important;animation:subIn .5s ease}
 .sub-mode .m.o{align-self:center!important;text-align:center}
+.sub-mode .m.pm{font-size:22px;line-height:1.3}
+.sub-mode .m.pm .pm-s{color:#b0b0b0!important;text-shadow:0 2px 8px rgba(0,0,0,.8)}
+.sub-mode .m.pm .pm-t{color:#808080!important;font-style:italic;text-shadow:0 2px 8px rgba(0,0,0,.8)}
 .sub-mode .m.s{align-self:flex-end!important;text-align:right}
 .sub-mode.bidi .m.o{align-self:flex-start!important;text-align:left}
 @keyframes subIn{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
@@ -947,7 +953,7 @@ async function stop(){
 }
 let _paused=false;
 function togglePause(){const next=!_paused;flash(next?'暫停':'繼續',()=>{_paused=next;if(curCfg.mode==='record'){if(next)_pauseAt=Date.now();else if(_pauseAt){_pausedMs+=Date.now()-_pauseAt;_pauseAt=0}_recRefresh()}_ttsPauseAudio(_paused);$('pauseBtn').innerHTML=_paused?'繼續 <kbd>P</kbd>':'暫停 <kbd>P</kbd>';$('pauseBtn').style.background=_paused?'var(--green)':'var(--orange)';if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({action:_paused?'pause':'resume'}))})}
-function _subModeLimit(){if(!$('pLive').classList.contains('sub-mode'))return;const ms=[...msgsEl.querySelectorAll('.m')];ms.forEach((m,i)=>{m.style.display=i>=ms.length-2?'':'none'})}
+function _subModeLimit(){if(!$('pLive').classList.contains('sub-mode'))return;const ms=[...msgsEl.querySelectorAll('.m:not(.pm)')];ms.forEach((m,i)=>{m.style.display=i>=ms.length-2?'':'none'})}
 function toggleSubMode(){const entering=!$('pLive').classList.contains('sub-mode');flash(entering?'字幕模式':'對話模式',()=>{const p=$('pLive');p.classList.toggle('sub-mode');$('subBtn').classList.toggle('active');$('subBtn').innerHTML=p.classList.contains('sub-mode')?'對話模式 <kbd>T</kbd>':'字幕模式 <kbd>T</kbd>';if(p.classList.contains('sub-mode')){_subModeLimit()}else{msgsEl.querySelectorAll('.m').forEach(m=>{m.style.display=''});requestAnimationFrame(()=>{msgsEl.scrollTop=msgsEl.scrollHeight})}})}
 function showLive(){
   const setup=$('pSetup'),live=$('pLive');
@@ -1156,20 +1162,27 @@ function _renderMsg(ev){dot.classList.add('on');if(cnt===0)$('bInfo').textConten
   if(ev.dst_text)h+='<div class="m-d">'+trBadge+'<span class="m-lang m-lang-dst">'+esc(ev.dst_lang||'')+'</span>'+ipB+'<span class="m-text">'+esc(ev.dst_text)+'</span></div>';
   else if(ipB)h=h.replace('<span class="m-lang m-lang-src">'+esc(ev.src_lang||'')+'</span>','<span class="m-lang m-lang-src">'+esc(ev.src_lang||'')+'</span>'+ipB);d.innerHTML=h;if(ev.interp_id){d.dataset.iid=ev.interp_id;_ipApply(ev.interp_id,d)}
   if(_rp)d.querySelector('.m-replay').onclick=()=>ttsReplay(ev.tts_seq);
-  if(_mg)_mg.replaceWith(d);else msgsEl.appendChild(d);
+  if(_mg)_mg.replaceWith(d);else{const _pm=$('pm');if(_pm)msgsEl.insertBefore(d,_pm);else msgsEl.appendChild(d)}
   if(ev.tts_seq==null)_lastBySrc[ev.source]={el:d,src:ev.src_text,t:Date.now()};
-  // 訊息上限 500 筆（避免 DOM 過多影響效能）
-  const _mList=msgsEl.querySelectorAll('.m');
+  // 訊息上限 500 筆（避免 DOM 過多影響效能；暫時字幕 #pm 不計）
+  const _mList=msgsEl.querySelectorAll('.m:not(.pm)');
   if(_mList.length>500){
-    while(msgsEl.querySelectorAll('.m').length>500){const old=msgsEl.querySelector('.m');if(old)old.remove();else break}
+    while(msgsEl.querySelectorAll('.m:not(.pm)').length>500){const old=msgsEl.querySelector('.m:not(.pm)');if(old)old.remove();else break}
     if(!$('msgLimitNote')){const n=document.createElement('div');n.id='msgLimitNote';n.style.cssText='text-align:center;padding:10px 16px;font-size:12px;color:var(--text-dim);background:var(--section-bg);border-radius:8px;margin:8px auto;max-width:360px';n.textContent='僅顯示最近 500 筆，完整內容已寫入逐字稿記錄檔';msgsEl.insertBefore(n,msgsEl.firstChild)}
   }
   // 字幕模式：只顯示最近 2 個（隱藏其他，不刪除）
   if($('pLive').classList.contains('sub-mode'))_subModeLimit();
   if(aScr)requestAnimationFrame(()=>{msgsEl.scrollTop=msgsEl.scrollHeight})}
+/* 暫時字幕：單一 #pm，永遠在 #msgs 最後，就地更新不重建（不重播進場動畫），不計句數無徽章 */
+function _partialMsg(ev){const st=ev.stable||'',te=ev.tentative||'';let el=$('pm');
+  if(!st&&!te){if(el)el.remove();return}
+  if(!el){el=document.createElement('div');el.id='pm';el.className='m o pm';msgsEl.appendChild(el)}
+  el.innerHTML='<span class="pm-s">'+esc(st)+'</span>'+(te?'<span class="pm-t">'+esc(te)+'</span>':'');
+  if(aScr)requestAnimationFrame(()=>{msgsEl.scrollTop=msgsEl.scrollHeight})}
+function _rmPartial(){const el=$('pm');if(el)el.remove()}
 /* WS */
 function conn(){const p=location.protocol==='https:'?'wss:':'ws:';const _wsUrl=p+'//'+location.host+'/ws'+(_authToken?'?token='+encodeURIComponent(_authToken):'');ws=new WebSocket(_wsUrl);ws.onopen=()=>{if(rTimer){clearInterval(rTimer);rTimer=null}};
-  ws.onmessage=e=>{try{const ev=JSON.parse(e.data);if(ev.type==='transcription')addMsg(ev);else if(ev.type==='started'){if(ev.pid)_curPid=ev.pid;curCfg.modeLabel=_modeLabels[ev.mode]||ev.mode;curCfg.mode=ev.mode;if(_ttsReplayKeep!==null){_ttsReplayKeep=null}else if(!_isSwitching){showLive()}dot.classList.add('on')}else if(ev.type==='stopped'&&!_isSwitching){_ttsAudioReset();if(curCfg.isFile){showSetup()}else{showDisconnected(_stopTitle())}}else if(ev.type==='disconnected'){if(_isSwitching)return;if(ev.pid&&_curPid&&ev.pid!==_curPid)return;_ttsAudioReset();dot.classList.remove('on');_discDetail=ev.detail||'';showDisconnected(ev.user_stop&&ev.rc===0?_stopTitle():(ev.message||'主程式已結束'),true)}else if(ev.type==='switching'){$('bInfo').textContent=ev.message||'切換中...'}else if(ev.type==='rms'&&ev.value!=null)pushVol(ev.value);else if(ev.type==='rec_size')_recSize(ev);else if(ev.type==='rec_stopped')_recStopped(ev);else if(ev.type==='output_files'){_outputFiles=ev.files||[];_outputDirs=ev.dirs||[];_renderDisc()}else if(ev.type==='keyword_alert'){_handleKeywordAlert(ev)}else if(ev.type==='tts_info'){_ttsLiveInfo(ev)}else if(ev.type==='tts_audio'){_ttsOnAudio(ev)}else if(ev.type==='interp'){_ipOnEvent(ev)}else if(ev.type==='interp_rate'){_ipRate[ev.lane]=ev.rate;_ipRateShow(ev.lane)}else if(ev.type==='correction'){addCorrection(ev)}else if(ev.type==='progress'){$('bInfo').textContent=ev.stage+(ev.detail?' — '+ev.detail:'');if(ev.finishing){const b=$('stopBtn');if(b.disabled)b.textContent='存檔中...'}}}catch(x){}};
+  ws.onmessage=e=>{try{const ev=JSON.parse(e.data);if(ev.type==='transcription')addMsg(ev);else if(ev.type==='partial')_partialMsg(ev);else if(ev.type==='started'){_rmPartial();if(ev.pid)_curPid=ev.pid;curCfg.modeLabel=_modeLabels[ev.mode]||ev.mode;curCfg.mode=ev.mode;if(_ttsReplayKeep!==null){_ttsReplayKeep=null}else if(!_isSwitching){showLive()}dot.classList.add('on')}else if(ev.type==='stopped'&&!_isSwitching){_rmPartial();_ttsAudioReset();if(curCfg.isFile){showSetup()}else{showDisconnected(_stopTitle())}}else if(ev.type==='disconnected'){if(_isSwitching)return;_rmPartial();if(ev.pid&&_curPid&&ev.pid!==_curPid)return;_ttsAudioReset();dot.classList.remove('on');_discDetail=ev.detail||'';showDisconnected(ev.user_stop&&ev.rc===0?_stopTitle():(ev.message||'主程式已結束'),true)}else if(ev.type==='switching'){$('bInfo').textContent=ev.message||'切換中...'}else if(ev.type==='rms'&&ev.value!=null)pushVol(ev.value);else if(ev.type==='rec_size')_recSize(ev);else if(ev.type==='rec_stopped')_recStopped(ev);else if(ev.type==='output_files'){_outputFiles=ev.files||[];_outputDirs=ev.dirs||[];_renderDisc()}else if(ev.type==='keyword_alert'){_handleKeywordAlert(ev)}else if(ev.type==='tts_info'){_ttsLiveInfo(ev)}else if(ev.type==='tts_audio'){_ttsOnAudio(ev)}else if(ev.type==='interp'){_ipOnEvent(ev)}else if(ev.type==='interp_rate'){_ipRate[ev.lane]=ev.rate;_ipRateShow(ev.lane)}else if(ev.type==='correction'){addCorrection(ev)}else if(ev.type==='progress'){$('bInfo').textContent=ev.stage+(ev.detail?' — '+ev.detail:'');if(ev.finishing){const b=$('stopBtn');if(b.disabled)b.textContent='存檔中...'}}}catch(x){}};
   ws.onclose=()=>{dot.classList.remove('on');if($('pLive').classList.contains('on')&&!_discShown){_discShown=true;showDisconnected('與伺服器的連線已中斷')}if(!rTimer)rTimer=setInterval(()=>{if(!ws||ws.readyState===WebSocket.CLOSED)conn()},3000)};ws.onerror=()=>ws.close()}
 // Tooltips
 const _tips={

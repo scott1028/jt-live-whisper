@@ -1316,6 +1316,24 @@ async def api_reopen_overlay(request: Request):
         config_path = str(CONFIG_FILE)
         if not Path(overlay_script).is_file():
             return JSONResponse({"ok": False, "error": "找不到 subtitle_overlay.py"})
+        # AppImage: first overlay use downloads the PyQt6 pack; report through
+        # the same progress events the engine sends, off the event loop
+        from jtlw_packs import ensure_pack
+
+        def _progress(stage, detail):
+            if _event_queue:
+                try:
+                    _event_queue.put_nowait(json.dumps(
+                        {"type": "progress", "stage": stage, "detail": detail},
+                        ensure_ascii=False))
+                except Exception:
+                    pass
+
+        _progress("載入中", "懸浮字幕套件")
+        try:
+            await asyncio.to_thread(ensure_pack, "overlay", "懸浮字幕")
+        finally:
+            _progress("", "")
         proc = subprocess.Popen(
             [sys.executable, overlay_script, "--config", config_path],
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0

@@ -21013,7 +21013,7 @@ def main():
             _early_bidi_devs = _detect_bidi_devices()
             if _early_bidi_devs:
                 try:
-                    print(f"\n{C_WHITE}是否同時轉錄本機麥克風輸入？[y/N]{RESET} ", end="", flush=True)
+                    print(f"\n{C_WHITE}是否同時轉錄本機麥克風輸入？[y/{C_HIGHLIGHT}N{C_WHITE}]{RESET} ", end="", flush=True)
                     _mic_ans = input().strip().lower()
                     _early_mic = _mic_ans in ("y", "yes")
                 except (EOFError, KeyboardInterrupt):
@@ -21176,7 +21176,7 @@ def main():
                 bidi_devs = _detect_bidi_devices()
                 if bidi_devs:
                     try:
-                        print(f"\n{C_WHITE}是否同時轉錄本機麥克風輸入？（ASR 負載加倍，需考慮主機效能是否足夠）[y/N]{RESET} ", end="", flush=True)
+                        print(f"\n{C_WHITE}是否同時轉錄本機麥克風輸入？（ASR 負載加倍，需考慮主機效能是否足夠）[y/{C_HIGHLIGHT}N{C_WHITE}]{RESET} ", end="", flush=True)
                         _mic_ans = input().strip().lower()
                         use_mic = _mic_ans in ("y", "yes")
                     except (EOFError, KeyboardInterrupt):

@@ -477,6 +477,15 @@ C_BADGE_ASR = "\x1b[48;2;90;90;90m\x1b[38;2;200;200;200m"  # 灰底灰字 - 辨�
 C_BADGE_MY_TRANS = "\x1b[48;2;130;90;180m\x1b[38;2;240;230;255m"  # 紫底淡紫字 - 我方翻譯耗時
 
 
+def _char_display_width(c):
+    """可見寬度單字元版：中日韓／全形＝2 格，其他 1 格（跳脫碼呼叫端先剝掉）"""
+    if ('\u4e00' <= c <= '\u9fff' or '\u3000' <= c <= '\u303f'
+            or '\u3040' <= c <= '\u309f' or '\u30a0' <= c <= '\u30ff'
+            or '\uff00' <= c <= '\uffef' or '\u3400' <= c <= '\u4dbf'):
+        return 2
+    return 1
+
+
 def _str_display_width(s):
     """計算字串可見寬度（去除 ANSI 跳脫碼，CJK/全形算 2 格）"""
     w = 0
@@ -489,66 +498,158 @@ def _str_display_width(s):
             if c == 'm':
                 in_esc = False
             continue
-        if ('\u4e00' <= c <= '\u9fff' or '\u3000' <= c <= '\u303f'
-                or '\u3040' <= c <= '\u309f' or '\u30a0' <= c <= '\u30ff'
-                or '\uff00' <= c <= '\uffef' or '\u3400' <= c <= '\u4dbf'):
-            w += 2
-        else:
-            w += 1
+        w += _char_display_width(c)
     return w
 
 
-def _wrap_display(text, width):
-    """Hard-wrap text by display width (same column rule as _str_display_width:
-    CJK/fullwidth = 2 columns), like the terminal's auto-wrap of final subtitles.
-    Returns a list of lines each at most width wide; a double-width char is
-    never split, so a char wider than width gets its own line. '' -> []."""
-    lines = []
-    cur = ""
-    w = 0
-    for c in text:
-        cw = _str_display_width(c)
-        if cur and w + cw > width:
-            lines.append(cur)
-            cur = ""
-            w = 0
-        cur += c
-        w += cw
+def _split_wide(s, width):
+    """Hard-split an oversize token at character boundaries (CJK never split);
+    inline ANSI escapes ride along with the text, zero width, never cut."""
+    chunks, cur, cw = [], "", 0
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] == "\x1b":
+            j = s.find("m", i)
+            j = n if j < 0 else j + 1
+            cur += s[i:j]
+            i = j
+            continue
+        chw = _char_display_width(s[i])
+        if cur and cw + chw > width:
+            chunks.append(cur)
+            cur, cw = "", 0
+        cur += s[i]
+        cw += chw
+        i += 1
     if cur:
-        lines.append(cur)
+        chunks.append(cur)
+    return chunks
+
+
+def _wrap_display(text, width):
+    """依可見寬度換行但不切斷單字：只在空白（換行處的空白直接丟掉）和中日韓字元
+    前後斷行；英文單字和 `package.json` 這類連續非空白字串不從中間切，只有單一
+    token 比 width 還寬時才硬切。ANSI 跳脫碼寬度算 0，留在原本相鄰的字上。
+    回傳每行不超過 width 格的字串清單；'' -> []。"""
+    width = max(1, width)
+    # tokenize into breakable units: (leading_ansi, body, w, is_space);
+    # word runs stay whole (inline ANSI rides inside), each CJK char is its own unit
+    units = []
+    ansi, i, n = "", 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\x1b":
+            j = text.find("m", i)
+            j = n if j < 0 else j + 1
+            ansi += text[i:j]
+            i = j
+            continue
+        if c == " ":
+            j = i
+            while j < n and text[j] == " ":
+                j += 1
+            units.append((ansi, text[i:j], j - i, True))
+            ansi, i = "", j
+            continue
+        if _char_display_width(c) == 2:
+            units.append((ansi, c, 2, False))
+            ansi, i = "", i + 1
+            continue
+        body, wc = "", 0
+        while i < n:
+            c = text[i]
+            if c == "\x1b":               # escape inside a word: keep it there
+                j = text.find("m", i)
+                j = n if j < 0 else j + 1
+                body += text[i:j]
+                i = j
+                continue
+            if c == " " or _char_display_width(c) == 2:
+                break
+            body += c
+            wc += 1
+            i += 1
+        units.append((ansi, body, wc, False))
+        ansi = ""
+    if ansi:
+        units.append((ansi, "", 0, False))    # dangling tail escape
+
+    lines = []
+    line, lw = "", 0
+    gap, gapw = "", 0     # pending space run = break opportunity
+    for a, body, w, sp in units:
+        if sp:
+            gap += a + body
+            gapw += w
+            continue
+        if not body:                          # tail escape rides the gap
+            gap += a
+            continue
+        if lw and lw + gapw + w > width:      # break: drop the spaces, keep ANSI
+            lines.append(line)
+            line, lw = "", 0
+            a = gap.replace(" ", "") + a
+            gap, gapw = "", 0
+        elif not lw and gap:                  # line head: spaces dropped
+            line = gap.replace(" ", "")
+            gap, gapw = "", 0
+        if lw + w > width:                    # single oversize token: hard-split
+            for k, ck in enumerate(_split_wide(body, width)):
+                lines.append((line + a if k == 0 else "") + ck)
+            line, lw = "", 0
+            continue
+        line += gap + a + body
+        lw += gapw + w
+        gap, gapw = "", 0
+    rest = line + gap.replace(" ", "")
+    if rest:
+        lines.append(rest)
     return lines
 
 
+def _term_cols():
+    """Terminal columns, 80 fallback when the real size is unavailable."""
+    try:
+        cols = os.get_terminal_size().columns
+    except Exception:
+        return 80
+    return cols if cols > 0 else 80
+
+
+def _wrap_terminal(text):
+    """Pre-wrap a subtitle line to _term_cols() - 1 so the terminal's own
+    hard-wrap never splits a word; returns the multi-line string to print."""
+    return "\n".join(_wrap_display(text, _term_cols() - 1) or [text])
+
+
 def _print_with_badge(text, badge_color, elapsed, label=""):
-    """輸出翻譯文字 + 速度 badge，避免 badge 換行導致背景色延伸整行。
+    """輸出翻譯文字 + 速度 badge；先用 _wrap_display 依單字斷行（終端機不會再
+    切斷單字），badge 位置照最後一行的寬度計算、至少留一欄空位，避免 badge 換行
+    導致背景色延伸整行。
     可透過 config.json 設定隱藏：hide_asr_time (辨識) / hide_translate_time (翻譯)"""
+    cols = _term_cols()
+    lines = _wrap_display(text, cols - 1) or [""]
+    wrapped = "\n".join(lines)
     # 檢查是否隱藏此類 badge
     if label == "辨" and _config.get("hide_asr_time", False):
-        print(text, flush=True)
+        print(wrapped, flush=True)
         return
     if label == "譯" and _config.get("hide_translate_time", False):
-        print(text, flush=True)
+        print(wrapped, flush=True)
         return
     if label:
         badge_str = f" {label} {elapsed:.1f}s "
     else:
         badge_str = f" {elapsed:.1f}s "
     badge_len = len(badge_str)
-    text_width = _str_display_width(text)
-    try:
-        cols = os.get_terminal_size().columns
-    except Exception:
-        cols = 80
-    if cols <= 0:
-        cols = 80
-    cursor_col = text_width % cols
+    last_w = _str_display_width(lines[-1])
     # >= cols: keep one free column after the badge; an exact fit makes some
     # terminals auto-wrap with the badge background still active (full-width bar)
-    if cursor_col + 2 + badge_len >= cols:
+    if last_w + 2 + badge_len >= cols:
         # badge 放不下，換行後縮排顯示
-        print(f"{text}\n    {badge_color}{badge_str}{RESET}", flush=True)
+        print(f"{wrapped}\n    {badge_color}{badge_str}{RESET}", flush=True)
     else:
-        print(f"{text}  {badge_color}{badge_str}{RESET}", flush=True)
+        print(f"{wrapped}  {badge_color}{badge_str}{RESET}", flush=True)
 
 
 def _speed_badge_color(elapsed):
@@ -8282,7 +8383,7 @@ def run_stream_moonshine(capture_id: int, translator, moonshine_model_name: str,
                 if mode == "en":
                     with print_lock:
                         _clear_partial_line()
-                        print(f"{C_EN}{BOLD}[EN] {text}{RESET}", flush=True)
+                        print(_wrap_terminal(f"{C_EN}{BOLD}[EN] {text}{RESET}"), flush=True)
                         print(flush=True)
                         _status_bar_state["count"] += 1
                         refresh_status_bar()
@@ -8884,7 +8985,7 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
                 else:
                     # 純轉錄
                     with print_lock:
-                        print(f"{src_color}{BOLD}[{src_label}] {line}{RESET}", flush=True)
+                        print(_wrap_terminal(f"{src_color}{BOLD}[{src_label}] {line}{RESET}"), flush=True)
                         print(flush=True)
                         _status_bar_state["count"] += 1
                         refresh_status_bar()
@@ -9853,7 +9954,7 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             with print_lock:
                 if use_la:
                     _la_clear_line()
-                print(f"{src_color}{BOLD}[{src_label}] {line}{RESET}", flush=True)
+                print(_wrap_terminal(f"{src_color}{BOLD}[{src_label}] {line}{RESET}"), flush=True)
                 print(flush=True)
                 _status_bar_state["count"] += 1
                 refresh_status_bar()

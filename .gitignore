@@ -9,6 +9,8 @@ venv/
 
 # 編譯產物
 whisper.cpp/
+dist/
+packaging/appimage/packs/
 
 # 使用者設定
 config.json

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=jt-live-whisper
+Comment=即時語音字幕與翻譯：啟動後自動套用上次選好的設定（無則進入互動選單）
+Exec=AppRun
+Icon=jt-live-whisper
+Terminal=true
+Categories=AudioVideo;Audio;Utility;

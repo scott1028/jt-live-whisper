@@ -1,0 +1,209 @@
+#!/bin/bash
+# jt-live-whisper AppImage launcher (self-contained build: portable Python
+# and the core packages live inside the AppImage; optional feature packs and
+# models are downloaded into the data dir on first use).
+#
+# Data root  R = ${JTLW_DATA_DIR:-${XDG_DATA_HOME:-~/.local/share}/jt-live-whisper}
+#   R/home   work home H: every app/ entry is symlinked here, so the program
+#            writes config.json / logs/ / recordings/ / start-last.sh into H
+#   R/packs  on-demand packs (exported as JTLW_PACKS_DIR)
+
+APP="${APPIMAGE:-$0}"
+
+# ── double-clicked (no terminal): relaunch inside a terminal window ────────
+# Only for a real double-click: BOTH stdin and stdout off a tty AND a
+# graphical session. Redirects, cron, systemd and headless containers must
+# run directly. Re-run "$APPIMAGE", never a path under $APPDIR - that mount
+# disappears once this AppRun exits.
+if [ ! -t 0 ] && [ ! -t 1 ] \
+        && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } \
+        && [ -z "${JTLW_IN_TERM:-}" ]; then
+    run_cmd=(env JTLW_IN_TERM=1 "$APP" "$@")
+    term=""
+    for cand in "$TERMINAL" x-terminal-emulator konsole gnome-terminal \
+                xfce4-terminal kitty alacritty wezterm xterm; do
+        [ -n "$cand" ] && command -v "$cand" >/dev/null 2>&1 && { term="$cand"; break; }
+    done
+    case "$term" in
+        "")  # no terminal emulator available: just continue right here
+            if command -v notify-send >/dev/null 2>&1; then
+                notify-send jt-live-whisper \
+                    "找不到終端機程式，直接於目前環境執行這個 AppImage"
+            fi
+            echo "找不到終端機程式，直接於目前環境執行。" >&2
+            ;;
+        gnome-terminal) "$term" -- "${run_cmd[@]}"; exit $? ;;
+        kitty)          "$term" "${run_cmd[@]}"; exit $? ;;
+        wezterm)        "$term" start -- "${run_cmd[@]}"; exit $? ;;
+        *)              "$term" -e "${run_cmd[@]}"; exit $? ;;
+    esac
+fi
+
+# flags that only print and exit -> never let the gpu prompt stand in front
+NONRUN=""
+for _arg in "$@"; do
+    case "$_arg" in
+        -h|--help|--version|--list-devices|--install-pack) NONRUN=1 ;;
+    esac
+done
+
+# ── data dirs: R, H (= work home), R/packs ─────────────────────────────────
+R="${JTLW_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/jt-live-whisper}"
+H="$R/home"
+mkdir -p "$H" "$R/packs" || { echo "無法建立資料目錄：$R" >&2; exit 1; }
+export JTLW_PACKS_DIR="$R/packs"
+
+# another launcher still running? short warning only, then continue
+LOCK="$R/.appimage.pid"
+if [ -f "$LOCK" ]; then
+    prev="$(cat "$LOCK" 2>/dev/null)"
+    if [ -n "$prev" ] && [ "$prev" != "$$" ] && kill -0 "$prev" 2>/dev/null; then
+        echo "[提示] 似乎另一個 jt-live-whisper（PID $prev）還在執行；同時開兩個時後開的會蓋掉連結資料夾。"
+    fi
+fi
+echo $$ > "$LOCK"
+
+# refresh symlinks in H for every app/ entry: replace symlinks, never touch
+# real files/dirs in H; drop links whose entry no longer exists in app/
+shopt -s nullglob dotglob
+for entry in "$APPDIR/app"/*; do
+    name="${entry##*/}"
+    if [ -e "$H/$name" ] && [ ! -L "$H/$name" ]; then
+        continue  # user's own file/dir: never overwrite
+    fi
+    ln -sfn "$entry" "$H/$name"
+done
+for t in "$H"/*; do
+    [ -L "$t" ] || continue
+    [ -e "$APPDIR/app/${t##*/}" ] || rm -f "$t"
+done
+shopt -u nullglob dotglob
+
+# ── Python environment ──────────────────────────────────────────────────────
+PY="$APPDIR/usr/python/bin/python3.12"
+if [ ! -x "$PY" ]; then
+    echo "錯誤：AppImage 內找不到可攜式 Python（$PY）" >&2
+    read -r -p "按 Enter 關閉視窗" _ || true
+    exit 1
+fi
+export PATH="$APPDIR/usr/python/bin:$PATH"
+unset PYTHONHOME PYTHONPATH
+export PYTHONNOUSERSITE=1
+export JTLW_START_CMD="$APP"
+export JTLW_APPIMAGE=1
+
+pack_complete() {  # $1: pack name -> 0 when the completion marker exists
+    compgen -G "$JTLW_PACKS_DIR/$1/.jtlw-complete-*" > /dev/null
+}
+has_nvidia() {  # real GPU access: containers expose /proc/driver/nvidia/version
+    [ -e /dev/nvidiactl ] || return 1
+    nvidia-smi -L >/dev/null 2>&1 && return 0
+    [ -e /proc/driver/nvidia/version ]
+}
+nv_libpath() {  # cuBLAS/cuDNN dirs of a completed gpu pack (like start.sh)
+    local d
+    for d in "$JTLW_PACKS_DIR/gpu/nvidia/cublas/lib" \
+             "$JTLW_PACKS_DIR/gpu/nvidia/cudnn/lib"; do
+        [ -d "$d" ] && LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    done
+    export LD_LIBRARY_PATH
+}
+LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+pack_complete gpu && nv_libpath
+
+# ── manual pack install (AppImage --install-pack <name|all>) ───────────────
+if [ "${1:-}" = "--install-pack" ]; then
+    if [ -z "${2:-}" ]; then
+        echo "用法：$APP --install-pack <gpu|ml|overlay|argos|moonshine|all>" >&2
+        rm -f "$LOCK"; exit 2
+    fi
+    cd "$H" || exit 1
+    "$PY" "$H/jtlw_packs.py" install "${@:2}"
+    rc=$?
+    rm -f "$LOCK"
+    exit "$rc"
+fi
+
+# ── environment check (missing items are listed, then continue) ────────────
+echo "── 環境檢查 ──────────────────────────────────────────────"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "[缺] ffmpeg（錄音檔格式轉換需要）：sudo apt install ffmpeg"
+fi
+if ! command -v parec >/dev/null 2>&1 && ! command -v pw-record >/dev/null 2>&1; then
+    echo "[缺] 系統音訊擷取工具（parec 或 pw-record）：sudo apt install pulseaudio-utils"
+fi
+if command -v fc-list >/dev/null 2>&1; then
+    fc-list :lang=zh 2>/dev/null | grep -q . || \
+        echo "[缺] 中文字型（選單與字幕會亂碼）：sudo apt install fonts-noto-cjk"
+else
+    echo "[缺] fontconfig/fc-list（無法確認中文字型）：sudo apt install fontconfig"
+fi
+if ! ldconfig -p 2>/dev/null | grep -q "libasound\.so\.2"; then
+    echo "[缺] ALSA 函式庫（內建 PortAudio 需要）：sudo apt install libasound2t64（Ubuntu 22.04 為 libasound2）"
+fi
+if ! ldconfig -p 2>/dev/null | grep -q "libpulse\.so\.0"; then
+    echo "[缺] PulseAudio 函式庫（內建 PortAudio 需要）：sudo apt install libpulse0"
+fi
+if ! ldconfig -p 2>/dev/null | grep -q "libxcb-cursor\.so"; then
+    echo "[缺] libxcb-cursor（字幕浮層需要）：sudo apt install libxcb-cursor0"
+fi
+if has_nvidia; then
+    echo "[資訊] 偵測到 NVIDIA 驅動（可用 GPU 加速；未安裝的套件會於首次使用時下載）"
+else
+    echo "[資訊] 未偵測到 NVIDIA 驅動，辨識與翻譯將使用 CPU"
+fi
+
+# ── gpu pack prompt (NVIDIA present, pack not installed, not declined) ─────
+if has_nvidia && ! pack_complete gpu && [ ! -f "$R/gpu-declined" ] \
+        && [ -z "$NONRUN" ]; then
+    echo ""
+    echo "偵測到 NVIDIA 顯示卡。安裝 gpu 套件（NVIDIA 函式庫，約 4 GB，只下載一次）"
+    echo "後，辨識與翻譯可用 GPU 加速；略過則用 CPU 執行，之後可手動安裝："
+    echo "  \"$APP\" --install-pack gpu"
+    if [ -t 0 ]; then
+        read -r -p "現在下載安裝嗎？(Y/n) " ans || ans="n"
+        case "${ans:-y}" in
+            [nN]*)
+                touch "$R/gpu-declined"
+                echo "已略過 gpu 套件（要改回來：刪除 $R/gpu-declined，或直接執行 --install-pack gpu）"
+                ;;
+            *)
+                cd "$H" && "$PY" "$H/jtlw_packs.py" install gpu
+                if pack_complete gpu; then
+                    nv_libpath
+                    echo "gpu 套件安裝完成，本次啟動即用 GPU 加速"
+                fi
+                ;;
+        esac
+    else
+        echo "[提示] 非互動模式，未安裝 gpu 套件：可用 \"$APP\" --install-pack gpu 下載"
+    fi
+fi
+
+# ── dispatch (run from H so the program writes into H) ─────────────────────
+cd "$H" || exit 1
+if [ $# -eq 0 ] && [ -f "$H/start-last.sh" ]; then
+    "$H/start-last.sh"
+    rc=$?
+elif [ "${1:-}" = "--webui" ]; then
+    shift
+    "$PY" "$H/webui.py" "$@"
+    rc=$?
+elif [ "${1:-}" = "--menu" ]; then
+    # skip start-last.sh and go straight to the interactive menu
+    shift
+    "$PY" "$H/translate_meeting.py" "$@"
+    rc=$?
+else
+    "$PY" "$H/translate_meeting.py" "$@"
+    rc=$?
+fi
+rm -f "$LOCK"
+
+# a window we opened ourselves must not vanish before the error is readable
+if [ "${JTLW_IN_TERM:-}" = "1" ] && [ "$rc" -ne 0 ]; then
+    printf '\033[38;2;100;100;100m按 Enter 關閉視窗\033[0m'
+    read -r _ || true
+fi
+exit "$rc"

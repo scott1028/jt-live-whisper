@@ -429,6 +429,27 @@ try:
 except ImportError:
     pass
 
+
+def _ensure_moonshine(reason=""):
+    """AppImage mode: download the moonshine pack on first use, then redo the
+    guarded import above. Returns True when Moonshine is usable."""
+    global _MOONSHINE_AVAILABLE
+    if _MOONSHINE_AVAILABLE:
+        return True
+    from jtlw_packs import ensure_pack
+    if not ensure_pack("moonshine", reason):
+        return False
+    try:
+        from moonshine_voice import get_model_for_language, ModelArch
+        from moonshine_voice.transcriber import Transcriber, TranscriptEventListener
+        globals().update(get_model_for_language=get_model_for_language,
+                         ModelArch=ModelArch, Transcriber=Transcriber,
+                         TranscriptEventListener=TranscriptEventListener)
+        _MOONSHINE_AVAILABLE = True
+    except ImportError:
+        pass
+    return _MOONSHINE_AVAILABLE
+
 # Windows WASAPI Loopback（零設定擷取系統播放音訊）
 WASAPI_LOOPBACK_ID = -100  # sentinel，表示使用 WASAPI Loopback
 WASAPI_MIXED_ID = -200     # sentinel，表示 Windows 混合錄音（Loopback + 麥克風）
@@ -727,13 +748,23 @@ for _nd in _nllb_search_dirs:
     if os.path.isdir(_nd) and os.path.isfile(os.path.join(_nd, "model.bin")):
         NLLB_MODEL_DIR = _nd
         break
+# default download target when the model is missing (same rule as install.sh)
+_NLLB_DEFAULT_DIR = _nllb_search_dirs[0] if _nllb_search_dirs else ""
 
 # 跨平台 Loopback 裝置偵測
 _LOOPBACK_LABEL = ("WASAPI Loopback" if IS_WINDOWS
                    else "PipeWire / PulseAudio 系統音訊" if IS_LINUX
                    else "BlackHole 2ch")
-_START_CMD = ".\\start.ps1" if IS_WINDOWS else "./start.sh"
+# AppImage mode (JTLW_START_CMD set by AppRun): printed 等效指令 shows the
+# AppImage path instead of start.sh
+import shlex as _shlex
+_START_CMD = (_shlex.quote(os.environ["JTLW_START_CMD"])
+              if os.environ.get("JTLW_START_CMD")
+              else ".\\start.ps1" if IS_WINDOWS else "./start.sh")
 _INSTALL_CMD = ".\\install.ps1" if IS_WINDOWS else "./install.sh"
+if os.environ.get("JTLW_APPIMAGE") == "1":
+    # AppImage has no installer: every installer hint suggests re-download
+    _INSTALL_CMD = "重新下載 jt-live-whisper AppImage"
 
 
 _overlay_proc_ref = None  # 全域參照，供 _force_exit 使用
@@ -2073,6 +2104,8 @@ def _enforce_qwen_model(mode, model_name, rw_cfg=None, quiet=False):
         if ok:
             return model_name
     else:
+        from jtlw_packs import ensure_pack
+        ensure_pack("ml", "Qwen3-ASR 辨識")  # AppImage: torch/transformers pack
         backend, device, why = _qwen_local_backend()
         if backend:
             if device == "cpu" and not quiet:
@@ -4297,7 +4330,14 @@ def check_dependencies(asr_engine="whisper", translate_engine=None):
     elif asr_engine == "whisper" and not IS_LINUX and not os.path.isfile(WHISPER_STREAM):
         errors.append(f"找不到 whisper-stream: {WHISPER_STREAM}")
     if asr_engine == "moonshine" and not _MOONSHINE_AVAILABLE:
-        errors.append("moonshine-voice 未安裝，請執行: pip install moonshine-voice sounddevice numpy")
+        # AppImage: first use downloads the moonshine pack here
+        if not _ensure_moonshine("Moonshine 辨識"):
+            errors.append("moonshine-voice 未安裝，請執行: pip install moonshine-voice sounddevice numpy")
+    if translate_engine == "argos":
+        # AppImage: install the argostranslate code pack first (the en->zh
+        # model package is fetched later by ArgosTranslator itself)
+        from jtlw_packs import ensure_pack
+        ensure_pack("argos", "Argos 離線翻譯")
     if translate_engine == "argos" and not os.path.isdir(ARGOS_PKG_PATH):
         errors.append(f"找不到翻譯模型: {ARGOS_PKG_PATH}")
     if translate_engine == "nllb" and not os.path.isdir(NLLB_MODEL_DIR):
@@ -4672,8 +4712,15 @@ def list_audio_devices(model_path):
 def select_asr_engine():
     """讓使用者選擇語音辨識引擎（Moonshine / Whisper）"""
     if not _MOONSHINE_AVAILABLE:
-        print(f"  {C_DIM}(Moonshine 未安裝，使用 Whisper){RESET}")
-        return "whisper"
+        from jtlw_packs import is_appimage, pack_size_mb
+        if is_appimage():
+            # AppImage: Moonshine 是選用套件，選了才下載，選單照樣開放
+            size = pack_size_mb("moonshine")
+            note = f"，選它會先下載約 {size} MB" if size else "，選它會先下載所需套件"
+            print(f"  {C_DIM}(Moonshine 未安裝{note}){RESET}")
+        else:
+            print(f"  {C_DIM}(Moonshine 未安裝，使用 Whisper){RESET}")
+            return "whisper"
 
     default_idx = 0  # Moonshine
 
@@ -5292,14 +5339,45 @@ def _note_translate_error(e):
           f"請檢查 LLM 伺服器（{OLLAMA_HOST}:{OLLAMA_PORT}）是否正常{RESET}", flush=True)
 
 
+def _argos_install_en_zh():
+    """Download and install the en->zh Argos package via the package API
+    (same flow as install.sh check_argos_model); returns the package path."""
+    from argostranslate import package
+
+    def _dl_install():
+        package.update_package_index()
+        pkg = next((p for p in package.get_available_packages()
+                    if p.from_code == "en" and p.to_code == "zh"), None)
+        if pkg is None:
+            raise RuntimeError("套件清單中找不到 en->zh 翻譯包")
+        package.install_from_path(pkg.download())
+        inst = [p for p in package.get_installed_packages()
+                if p.from_code == "en" and p.to_code == "zh"]
+        if not inst:
+            raise RuntimeError("安裝後找不到已安裝的 en->zh 翻譯包")
+        return inst[0].package_path
+
+    return _call_with_ssl_retry(_dl_install)
+
+
 class ArgosTranslator:
     """使用 ctranslate2 + sentencepiece 離線翻譯"""
 
     def __init__(self):
+        global ARGOS_PKG_PATH
+        from jtlw_packs import ensure_pack
+        ensure_pack("argos", "Argos 離線翻譯")
         if not os.path.isdir(ARGOS_PKG_PATH):
-            print(f"[錯誤] 找不到 Argos 翻譯模型: {ARGOS_PKG_PATH}", file=sys.stderr)
-            print(f"請執行 {_INSTALL_CMD} 重新安裝，或改用 LLM 伺服器翻譯", file=sys.stderr)
-            sys.exit(1)
+            # First use: fetch the en->zh package automatically
+            print(f"{C_DIM}找不到 Argos 英翻中模型，開始自動下載安裝...{RESET}", flush=True)
+            _webui_send({"type": "progress", "stage": "下載中", "detail": "Argos 英翻中模型"})
+            try:
+                ARGOS_PKG_PATH = _argos_install_en_zh()
+                print(f"  {C_OK}Argos 模型安裝完成：{ARGOS_PKG_PATH}{RESET}")
+            except Exception as e:
+                print(f"[錯誤] Argos 翻譯模型自動安裝失敗: {e}", file=sys.stderr)
+                print(f"請執行 {_INSTALL_CMD} 重新安裝，或改用 LLM 伺服器翻譯", file=sys.stderr)
+                sys.exit(1)
         print(f"{C_DIM}正在載入離線翻譯模型...{RESET}", end=" ", flush=True)
         _webui_send({"type": "progress", "stage": "載入中", "detail": "離線翻譯模型"})
         self.sp = sentencepiece.SentencePieceProcessor()
@@ -5395,6 +5473,15 @@ def _chunk_for_nllb(piece, max_chars):
              else [c[i:i + max_chars] for i in range(0, len(c), max_chars)])]
 
 
+def _nllb_download(model_dir):
+    """Download the NLLB 600M ct2 model into model_dir (same HF repo and
+    target dir rule as install.sh); SSL trouble retried unverified."""
+    from huggingface_hub import snapshot_download
+    _call_with_ssl_retry(snapshot_download,
+                         "JustFrederik/nllb-200-distilled-600M-ct2-int8",
+                         local_dir=model_dir)
+
+
 class NllbTranslator:
     """使用 NLLB 600M (CTranslate2) 離線多語言翻譯"""
 
@@ -5415,9 +5502,23 @@ class NllbTranslator:
     }
 
     def __init__(self, direction="en2zh"):
-        if not os.path.isdir(NLLB_MODEL_DIR):
+        global NLLB_MODEL_DIR
+        if not NLLB_MODEL_DIR:
+            NLLB_MODEL_DIR = _NLLB_DEFAULT_DIR
+        if not NLLB_MODEL_DIR:
             print(f"[錯誤] 找不到 NLLB 翻譯模型: 請執行 {_INSTALL_CMD} 安裝", file=sys.stderr)
             sys.exit(1)
+        if not os.path.isfile(os.path.join(NLLB_MODEL_DIR, "model.bin")):
+            # First use (or a partial download): fetch the model ourselves
+            print(f"\n  {C_DIM}首次使用，正在下載 NLLB 翻譯模型（約 600 MB）...{RESET}", flush=True)
+            _webui_send({"type": "progress", "stage": "下載中", "detail": "NLLB 翻譯模型（約 600 MB）"})
+            try:
+                _nllb_download(NLLB_MODEL_DIR)
+                print(f"  {C_OK}下載完成{RESET}")
+            except Exception as e:
+                print(f"[錯誤] NLLB 翻譯模型下載失敗: {e}", file=sys.stderr)
+                print(f"  {C_DIM}請確認網路後重新執行；或改用 LLM 伺服器翻譯（-e llm）{RESET}", file=sys.stderr)
+                sys.exit(1)
         src_key, tgt_key = self._DIRECTION_MAP.get(direction, ("en", "zh"))
         self.src_lang = self._LANG_MAP[src_key]
         # NLLB zho_Hant often stops after the first comma; zho_Hans translates
@@ -5431,9 +5532,7 @@ class NllbTranslator:
         if not os.path.exists(_cfg_path):
             print(f"\n  {C_DIM}模型缺少 config.json，正在重新下載...{RESET}", end=" ", flush=True)
             try:
-                from huggingface_hub import snapshot_download as _hf_dl
-                _hf_dl("JustFrederik/nllb-200-distilled-600M-ct2-int8",
-                       local_dir=NLLB_MODEL_DIR)
+                _nllb_download(NLLB_MODEL_DIR)
                 print(f"{C_OK}✓{RESET}")
             except Exception as _e:
                 print(f"\n  {C_HIGHLIGHT}[警告] 自動修復失敗: {_e}{RESET}")
@@ -19148,8 +19247,21 @@ def parse_args():
         (f"{_sc} --tts-file 講稿.txt --tts-device none --tts-save mp3", "文字轉語音檔（不播放）"),
         (f"{_sc} --tts-text '今天下午三點半開會。'", "直接念一段文字"),
     ]
+    if os.environ.get("JTLW_APPIMAGE") == "1":
+        examples[0] = (f"{_sc}", "互動式選單（有上次的設定 start-last.sh 時直接套用）")
     col = max(len(cmd) for cmd, _ in examples) + 3
     epilog = "範例:\n" + "\n".join(f"  {cmd:<{col}}{desc}" for cmd, desc in examples)
+    if os.environ.get("JTLW_APPIMAGE") == "1":
+        # AppImage-only flags: handled by the launcher (AppRun), not argparse
+        app_flags = [
+            ("--menu", "忽略上次的設定（start-last.sh），重新進入互動選單"),
+            ("--install-pack <名稱|all>", "下載選用套件包：gpu、ml、overlay、argos、moonshine"),
+        ]
+        acol = max(_str_display_width(c) for c, _ in app_flags) + 3
+        epilog += ("\n\nAppImage 專用參數（由 AppImage 啟動器處理）:\n"
+                   + "\n".join(
+                       f"  {c}{' ' * (acol - _str_display_width(c))}{d}"
+                       for c, d in app_flags))
     parser = argparse.ArgumentParser(
         description="即時英翻中字幕系統 jt-live-whisper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -19612,12 +19724,34 @@ def _write_quick_start(cli_cmd, quick_start):
             from datetime import datetime
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             path = os.path.join(SCRIPT_DIR, "start-last.sh")
+            if os.environ.get("JTLW_APPIMAGE") == "1":
+                # AppImage mode: exec the running AppImage (${APPIMAGE});
+                # a manual ./start-last.sh run falls back to the baked path
+                fallback = _shlex.quote(os.environ.get("JTLW_START_CMD", ""))
+                rest = (cli_cmd[len(_START_CMD):] if cli_cmd.startswith(_START_CMD)
+                        else " " + cli_cmd)
+                exec_line = f'exec "${{APPIMAGE:-{fallback}}}"{rest} -y "$@"\n'
+                reconfig = ("# 想重新設定：在終端機執行 AppImage 時加上 --menu，"
+                            "或刪除這個檔案（start-last.sh）後再啟動 AppImage\n")
+                hint_pre = ("提示：正在套用上次選好的設定（start-last.sh）。要重新設定："
+                            "執行 AppImage 時加上 --menu，或刪除 %s/start-last.sh ")
+                restart = "後重新啟動 AppImage。"
+            else:
+                exec_line = f'exec {cli_cmd} -y "$@"\n'
+                reconfig = ("# 想重新設定：刪除這個檔案（start-last.sh），"
+                            "再執行 ./start.sh 或 AppImage，就會重新進入互動選單\n")
+                hint_pre = ("提示：正在套用上次選好的設定（start-last.sh）。要重新設定，"
+                            "刪除 %s/start-last.sh ")
+                restart = "後重新啟動即可。"
             with open(path, "w", encoding="utf-8") as f:
                 f.write("#!/bin/bash\n"
                         f"# jt-live-whisper 快速啟動：套用 {stamp} 互動選單選的選項"
                         "（由程式自動產生，下次從選單選完會覆蓋）\n"
+                        + reconfig +
                         'cd "$(dirname "$0")" || exit 1\n'
-                        f'exec {cli_cmd} -y "$@"\n')
+                        "printf '\\033[38;2;100;100;100m" + hint_pre
+                        + restart + "\\033[0m\\n\' \"$PWD\"\n"
+                        + exec_line)
             os.chmod(path, 0o755)
             print(f"  {C_DIM}快速啟動檔已更新：./start-last.sh（下次直接執行就套用這次的選項）{RESET}")
         except Exception as e:
@@ -19714,6 +19848,8 @@ def main():
         if IS_LINUX and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             print(f"  {C_HIGHLIGHT}[懸浮字幕] 此工作階段沒有圖形桌面（DISPLAY 未設定），略過覆蓋視窗{RESET}")
         elif os.path.isfile(_overlay_script):
+            from jtlw_packs import ensure_pack
+            ensure_pack("overlay", "懸浮字幕")  # AppImage: PyQt6 pack
             # 清除前次殘留的 overlay 程序
             try:
                 if IS_WINDOWS:
@@ -19917,6 +20053,8 @@ def main():
 
         # --diarize 檢查 resemblyzer / spectralcluster
         if diarize:
+            from jtlw_packs import ensure_pack
+            ensure_pack("ml", "講者辨識")  # AppImage: resemblyzer/librosa pack
             try:
                 import warnings
                 with warnings.catch_warnings():

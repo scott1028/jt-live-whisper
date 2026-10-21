@@ -12,6 +12,7 @@ whisper.cpp/
 
 # 使用者設定
 config.json
+start-last.sh
 
 # 產出檔案
 logs/

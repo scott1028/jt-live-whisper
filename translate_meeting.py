@@ -19217,6 +19217,10 @@ def parse_args():
                          "會議軟體的麥克風設成「與系統相同」就會跟著切換）")
     ip.add_argument("--passthrough", action="store_true",
                     help="念給對方聽時，你的原聲也同時送進虛擬麥克風（念英文時原聲自動調小）。預設只送英文")
+
+    parser.add_argument(
+        "-y", "--yes", action="store_true",
+        help="跳過「確認開始？」直接開始（快速啟動檔使用）")
     return parser.parse_args()
 
 
@@ -19507,27 +19511,57 @@ def _build_cli_command(**kwargs):
     return " ".join(parts)
 
 
-def _confirm_start(cli_cmd):
-    """印出等效 CLI 指令，詢問 Y/n 確認。回傳 True 繼續、False 取消。"""
+_ASSUME_YES = False    # set from -y/--yes in main(): skip the start confirmation
+
+
+def _write_quick_start(cli_cmd, quick_start):
+    """Write start-last.sh (interactive live-mode confirmed start only) so the
+    next run can reuse this session's options. Returns True (confirm result);
+    a write failure warns but never blocks the start."""
+    if quick_start and not IS_WINDOWS:
+        try:
+            from datetime import datetime
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            path = os.path.join(SCRIPT_DIR, "start-last.sh")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("#!/bin/bash\n"
+                        f"# jt-live-whisper 快速啟動：套用 {stamp} 互動選單選的選項"
+                        "（由程式自動產生，下次從選單選完會覆蓋）\n"
+                        'cd "$(dirname "$0")" || exit 1\n'
+                        f'exec {cli_cmd} -y "$@"\n')
+            os.chmod(path, 0o755)
+            print(f"  {C_DIM}快速啟動檔已更新：./start-last.sh（下次直接執行就套用這次的選項）{RESET}")
+        except Exception as e:
+            print(f"  {C_DIM}快速啟動檔寫入失敗（不影響本次啟動）：{e}{RESET}")
+    return True
+
+
+def _confirm_start(cli_cmd, quick_start=False):
+    """印出等效 CLI 指令，詢問 Y/n 確認。回傳 True 繼續、False 取消。
+    quick_start=True（互動選單即時模式）時，確認開始後順帶寫出 start-last.sh。"""
     print(f"  {C_DIM}等效指令    {RESET}{C_OK}{cli_cmd}{RESET}")
     print(f"  {C_DIM}            （下次可直接執行，不需進入互動選單）{RESET}")
     print(f"{C_DIM}{'─' * 60}{RESET}")
     # 非互動執行（管線、排程、SSH 腳本）沒有人能回答，直接開始
     if not sys.stdin.isatty():
         print(f"\n{C_DIM}非互動執行，直接開始{RESET}")
-        return True
+        return _write_quick_start(cli_cmd, quick_start)
+    if _ASSUME_YES:
+        print(f"\n{C_DIM}已指定 -y，直接開始{RESET}")
+        return _write_quick_start(cli_cmd, quick_start)
     try:
         ans = input(f"\n{C_WHITE}確認開始？({C_HIGHLIGHT}Y{C_WHITE}/n)：{RESET}").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     if ans in ("", "y", "yes"):
-        return True
+        return _write_quick_start(cli_cmd, quick_start)
     return False
 
 
 def main():
-    global _diarize_engine
+    global _diarize_engine, _ASSUME_YES
     args = parse_args()
+    _ASSUME_YES = args.yes
     if (args.speak_me or args.speak_them) and (args.mode not in _INTERP_MODES or args.input or args.tts_file or args.tts_text):
         # 只有命令列的英中雙向即時模式會接口譯；其他情況靜靜忽略的話，使用者會以為有在念（畫面選的要真的生效）
         print(f"{C_ERR}[錯誤] --speak-me／--speak-them 要搭配即時的 --mode en_zh（英中雙向）{RESET}", file=sys.stderr)
@@ -20915,7 +20949,7 @@ def main():
             print(f"  {C_OK}錄音裝置: [{rec_id}] {rec_name}（{rec_label}）{RESET}")
             meeting_topic = _ask_topic(record_only=True)
             _cli_kw = dict(mode="record", device=rec_id, topic=meeting_topic)
-            if not _confirm_start(_build_cli_command(**_cli_kw)):
+            if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                 sys.exit(0)
             run_record_only(rec_id, topic=meeting_topic)
             sys.exit(0)
@@ -20989,7 +21023,7 @@ def main():
                 print(f"{C_ERR}[錯誤] 語音口譯：{_interp_err}{RESET}", file=sys.stderr)
                 _interp_linux_cleanup()
                 sys.exit(1)
-            if not _confirm_start(_build_cli_command(**_cli_kw)):
+            if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                 _interp_linux_cleanup()
                 sys.exit(0)
             print()
@@ -21074,7 +21108,7 @@ def main():
                            llm_model=model if mode in _TRANSLATE_MODES and engine == "llm" else None,
                            llm_host=_llm_display(host, port) if mode in _TRANSLATE_MODES and engine == "llm" else None,
                            denoise=args.denoise)
-            if not _confirm_start(_build_cli_command(**_cli_kw)):
+            if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                 sys.exit(0)
             run_stream_remote(capture_id, translator, r_model_name, REMOTE_WHISPER_CONFIG,
                               mode, length_ms=length_ms, step_ms=step_ms,
@@ -21191,7 +21225,7 @@ def main():
                                engine=engine if mode == "en2zh" and engine else None,
                                llm_model=model if mode == "en2zh" and engine == "llm" else None,
                                llm_host=_llm_display(host, port) if mode == "en2zh" and engine == "llm" else None)
-                if not _confirm_start(_build_cli_command(**_cli_kw)):
+                if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                     sys.exit(0)
                 run_stream_moonshine(capture_id, translator, ms_model_name, mode,
                                      record=record, rec_device=rec_device,
@@ -21223,7 +21257,7 @@ def main():
                                    llm_model=model if _need_llm else None,
                                    llm_host=_llm_display(host, port) if _need_llm else None,
                                    mic=True, denoise=args.denoise)
-                    if not _confirm_start(_build_cli_command(**_cli_kw)):
+                    if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                         sys.exit(0)
                     _mic_remote = REMOTE_WHISPER_CONFIG if (_mic_engine == "remote") else None
                     run_stream_bidirectional(_mic_lb_id, _mic_mic_id,
@@ -21247,7 +21281,7 @@ def main():
                                    llm_model=model if _need_llm else None,
                                    llm_host=_llm_display(host, port) if _need_llm else None,
                                    denoise=args.denoise)
-                    if not _confirm_start(_build_cli_command(**_cli_kw)):
+                    if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                         sys.exit(0)
                     run_stream_local_whisper(capture_id, translator, model_name, mode,
                                             length_ms=length_ms, step_ms=step_ms,
@@ -21264,7 +21298,7 @@ def main():
                                    engine=engine if mode in _TRANSLATE_MODES else None,
                                    llm_model=model if _need_llm else None,
                                    llm_host=_llm_display(host, port) if _need_llm else None)
-                    if not _confirm_start(_build_cli_command(**_cli_kw)):
+                    if not _confirm_start(_build_cli_command(**_cli_kw), quick_start=True):
                         sys.exit(0)
                     run_stream(capture_id, translator, model_name, model_path, length_ms, step_ms, mode,
                                record=record, rec_device=rec_device,

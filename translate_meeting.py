@@ -457,6 +457,7 @@ C_TITLE = "\x1b[38;2;100;180;255m"   # 藍色 - 標題
 C_HIGHLIGHT = "\x1b[38;2;255;220;80m" # 黃色 - 重點/預設
 C_EN = "\x1b[38;2;180;180;180m"       # 灰色 - 英文原文
 C_ZH = "\x1b[38;2;80;255;180m"        # 青綠 - 中文翻譯
+C_DST_DIM = "\x1b[38;2;90;150;120m"   # 灰綠 - 暫時翻譯
 C_JA = "\x1b[38;2;255;180;100m"       # 橙色 - 日文
 C_MY_ZH = "\x1b[38;2;120;200;255m"    # 水藍 - 我方中文原文（雙向模式）
 C_MY_EN = "\x1b[38;2;200;160;255m"   # 淡紫 - 我方英文翻譯（雙向模式）
@@ -541,7 +542,9 @@ def _print_with_badge(text, badge_color, elapsed, label=""):
     if cols <= 0:
         cols = 80
     cursor_col = text_width % cols
-    if cursor_col + 2 + badge_len > cols:
+    # >= cols: keep one free column after the badge; an exact fit makes some
+    # terminals auto-wrap with the badge background still active (full-width bar)
+    if cursor_col + 2 + badge_len >= cols:
         # badge 放不下，換行後縮排顯示
         print(f"{text}\n    {badge_color}{badge_str}{RESET}", flush=True)
     else:
@@ -5098,7 +5101,7 @@ class OllamaTranslator:
         cleaned = re.sub(r'[。．.](?:修正|文法的|より自然|翻訳すると|自然な).*$', '。', cleaned)
         return cleaned.strip()
 
-    def translate(self, text: str) -> str:
+    def translate(self, text: str, remember: bool = True) -> str:
         text = text.strip()
         if not text:
             return ""
@@ -5150,10 +5153,11 @@ class OllamaTranslator:
                 result = result.split("\n")[0].strip()
                 if self._contains_bad_chars(result):
                     return ""
-            # 更新上下文
-            self.context.append((text, result))
-            if len(self.context) > self.MAX_CONTEXT:
-                self.context.pop(0)
+            # 更新上下文（預覽執行緒傳 remember=False，不干擾正式翻譯的上下文）
+            if remember:
+                self.context.append((text, result))
+                if len(self.context) > self.MAX_CONTEXT:
+                    self.context.pop(0)
             return result
         except Exception as e:
             _note_translate_error(e)
@@ -9627,9 +9631,15 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 _trans_next[0] += 1
             src_text, result, elapsed, asr_elapsed = entry
             if use_la:                 # shown or filtered: the sentence
+                removed = False
                 with _la_disp_lock:    # leaves the interim caption either way
                     if src_text in _la_awaiting:
                         _la_awaiting.remove(src_text)
+                        removed = True
+                if removed:            # the old interim dst still contains it
+                    with _la_dst_lock:
+                        _la_dst[:] = ["", ""]
+                        _la_dst_gen[0] += 1    # invalidate an in-flight preview result
             if not result:
                 if not isinstance(result, _TranslateFailed):
                     continue                     # 被過濾掉的翻譯（幻覺、亂碼）：照舊整筆略過
@@ -9745,10 +9755,17 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     # ── 灰色暫時字幕（只在新流程 use_la 顯示，這裡的函式兩流程共用）──
     _la_awaiting = []          # sentences sent to translation, not yet displayed
     _la_partial = ["", ""]     # worker snapshot: (stable, tentative)
-    _la_shown = [0]            # interim caption lines currently on screen
-    _la_ws_pair = [None]       # last (stable, tentative) pushed to WebUI
+    _la_shown = [0]            # interim caption lines on screen (source + translation blocks)
+    _la_ws_pair = [None]       # last (stable, tentative, dst_text) pushed to WebUI
     _la_disp_lock = threading.Lock()
     _la_show_lock = threading.Lock()   # serializes full redraws (worker + translate threads)
+    # ── 灰綠色暫時翻譯（預覽執行緒：只翻最新一版，latest-wins 請求槽）──
+    _la_dst = ["", ""]         # interim translation: (source it translates, translation)
+    _la_dst_req = [None]       # request slot: newest source waiting to be translated
+    _la_dst_gen = [0]          # bumped on every clear: in-flight stale results drop out
+    _la_dst_ev = threading.Event()
+    _la_dst_lock = threading.Lock()
+    la_preview_enabled = use_la and mode in _TRANSLATE_MODES and bool(translator)
 
     def _la_clear_line():
         """Erase all interim caption lines if shown (caller holds print_lock).
@@ -9761,8 +9778,9 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
             _la_shown[0] = 0
 
     def la_show_partial():
-        """Redraw the grey interim caption and push a WebUI partial event on
-        change. The whole body is serialized so an older snapshot can never
+        """Redraw the grey interim caption (plus the grey-green interim
+        translation below it) and push a WebUI partial event on change.
+        The whole body is serialized so an older snapshot can never
         print or send after a newer one. Callers must NOT hold print_lock or
         _la_disp_lock; print_lock is taken here only around the print."""
         with _la_show_lock:
@@ -9783,25 +9801,43 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
                 text = _s2twp_safe(text)
                 ws_stable = _s2twp_safe(ws_stable)
                 tentative = _s2twp_safe(tentative)
+            with _la_dst_lock:
+                if not text:
+                    _la_dst[:] = ["", ""]      # grey line empty: interim dst goes too
+                    _la_dst_req[0] = None      # drop any queued preview request
+                    _la_dst_gen[0] += 1        # invalidate an in-flight preview result
+                    dst_text = ""
+                else:
+                    dst_text = _la_dst[1]
+                    if la_preview_enabled and text != _la_dst[0]:
+                        _la_dst_req[0] = text  # latest-wins: newest request replaces
+                        _la_dst_ev.set()
             if text:
                 cols, rows = shutil.get_terminal_size((80, 24))
-                lines = _wrap_display("[...] " + text, cols - 1)
-                keep = max(1, rows - 3)
-                if len(lines) > keep:
-                    lines = lines[-keep:]    # keep the newest tail lines
+                src_lines = _wrap_display("[...] " + text, cols - 1)
+                dst_lines = _wrap_display("[...] " + dst_text, cols - 1) if dst_text else []
+                over = len(src_lines) + len(dst_lines) - max(1, rows - 3)
+                if over > 0:    # drop head lines, source block first, >= 1 line each
+                    n = min(over, len(src_lines) - 1)
+                    src_lines, over = src_lines[n:], over - n
+                    dst_lines = dst_lines[min(over, len(dst_lines) - 1):]
                 with print_lock:
-                    _la_clear_line()         # erase the previous block first
-                    print("\r" + C_DIM + "\n".join(lines) + RESET,
-                          end="", flush=True)
-                    _la_shown[0] = len(lines)
+                    _la_clear_line()         # erase the previous blocks first
+                    block = C_DIM + "\n".join(src_lines) + RESET
+                    if dst_lines:
+                        block += "\n" + C_DST_DIM + "\n".join(dst_lines) + RESET
+                    print("\r" + block, end="", flush=True)
+                    _la_shown[0] = len(src_lines) + len(dst_lines)
             else:
                 with print_lock:
                     _la_clear_line()
-            pair = (ws_stable, tentative)
+            pair = (ws_stable, tentative, dst_text)
             if pair != _la_ws_pair[0]:
                 _la_ws_pair[0] = pair
                 _webui_send({"type": "partial", "source": "main", "src_lang": src_label,
-                             "stable": pair[0], "tentative": pair[1]})
+                             "stable": pair[0], "tentative": pair[1],
+                             "dst_lang": _MODE_LABELS[mode][3] if dst_text else "",
+                             "dst_text": dst_text})
 
     def emit_line(line, proc_time):
         """Shared emit tail for both flows: async translation or direct
@@ -9971,6 +10007,48 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
 
         la_thread = threading.Thread(target=la_worker, daemon=True)
 
+    # ── 暫時翻譯預覽執行緒（use_la + 翻譯模式）：latest-wins，只翻最新一版 ──
+    la_preview_thread = None
+    if la_preview_enabled:
+
+        def la_preview_worker():
+            """Translate the newest requested source only; results go to the
+            grey-green interim line, never to the log or the LLM context.
+            A result whose line was cleared while it was translating is dropped
+            (the newer request, if any, is already in the slot)."""
+            while not stop_event.is_set():
+                if not _la_dst_ev.wait(0.2):
+                    continue
+                _la_dst_ev.clear()
+                with _la_dst_lock:
+                    src = _la_dst_req[0]
+                    _la_dst_req[0] = None
+                    gen = _la_dst_gen[0]       # generation this request was taken in
+                if not src:
+                    continue
+                try:
+                    if isinstance(translator, OllamaTranslator):
+                        result = translator.translate(src, remember=False)
+                    else:
+                        result = translator.translate(src)
+                except Exception:
+                    continue
+                if not result or isinstance(result, _TranslateFailed):
+                    continue        # empty or failed: keep the previous interim dst
+                result = (_to_traditional(result) if isinstance(translator, OllamaTranslator)
+                          else _s2twp_safe(result))
+                if not result:
+                    continue
+                with _la_dst_lock:
+                    fresh = gen == _la_dst_gen[0]
+                    if fresh:
+                        _la_dst[:] = [src, result]
+                if not fresh:
+                    continue    # cleared while translating: drop the stale result
+                la_show_partial()
+
+        la_preview_thread = threading.Thread(target=la_preview_worker, daemon=True)
+
     # ── 清理 ──
     _cleaned_up = [False]
 
@@ -10068,6 +10146,8 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     # ── 主迴圈 ──
     if la_thread:
         la_thread.start()
+    if la_preview_thread:
+        la_preview_thread.start()
     step_sec = step_ms / 1000.0
     length_samples = ring_size
     next_transcribe_time = time.monotonic() + (length_ms / 1000.0)

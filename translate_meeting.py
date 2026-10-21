@@ -14273,9 +14273,9 @@ def _ask_input_source():
         return ("realtime", None)
 
 
-def _ask_record(prefer_mix=False):
+def _ask_record():
     """互動選單：詢問錄製音訊方式（混合/僅播放/不錄）。
-    prefer_mix=True 時預設選「混合錄製」（用於麥克風轉錄模式）。
+    一律預設「不錄製」。
     回傳 (record: bool, rec_device: int or None)"""
     import sounddevice as sd
 
@@ -14354,39 +14354,35 @@ def _ask_record(prefer_mix=False):
     _rec_label2 = "僅錄播放聲音         "  # 補 9 空格對齊到顯示寬 21
     _last_rec = _config.get("last_rec_choice")  # "1"=混合 / "2"=僅播放 / "3"=不錄製
     if has_aggregate and has_loopback:
-        default_choice = "1" if prefer_mix else "2"
+        default_choice = "3"
         _tag1 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "1" else ""
         _tag2 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "2" else ""
         _tag3 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "3" else ""
-        if prefer_mix:
-            print(f"  {C_HIGHLIGHT}{BOLD}[1] {_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag1}")
-            print(f"  {C_DIM}[2]{RESET} {C_WHITE}{_rec_label2}{RESET} {C_DIM}{loopback_name}{RESET}{_tag2}")
-        else:
-            print(f"  {C_DIM}[1]{RESET} {C_WHITE}{_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}{_tag1}")
-            print(f"  {C_HIGHLIGHT}{BOLD}[2] {_rec_label2}{RESET} {C_DIM}{loopback_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag2}")
-        print(f"  {C_DIM}[3]{RESET} {C_WHITE}不錄製{RESET}{_tag3}")
+        print(f"  {C_DIM}[1]{RESET} {C_WHITE}{_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}{_tag1}")
+        print(f"  {C_DIM}[2]{RESET} {C_WHITE}{_rec_label2}{RESET} {C_DIM}{loopback_name}{RESET}{_tag2}")
+        print(f"  {C_HIGHLIGHT}{BOLD}[3] 不錄製{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag3}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
         print(f"{C_WHITE}選擇 (1-3) [{default_choice}]：{RESET}", end=" ")
     elif has_loopback:
-        # 沒有聚集裝置，[1] 不可選，預設 [2]
+        # 沒有聚集裝置，[1] 不可選，預設 [3] 不錄製
         _tag2 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "2" else ""
         _tag3 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "3" else ""
         print(f"  {C_DIM}[1] {_rec_label1}  未偵測到聚集裝置{RESET}")
-        print(f"  {C_HIGHLIGHT}{BOLD}[2] {_rec_label2}{RESET} {C_DIM}{loopback_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag2}")
-        print(f"  {C_DIM}[3]{RESET} {C_WHITE}不錄製{RESET}{_tag3}")
+        print(f"  {C_DIM}[2]{RESET} {C_WHITE}{_rec_label2}{RESET} {C_DIM}{loopback_name}{RESET}{_tag2}")
+        print(f"  {C_HIGHLIGHT}{BOLD}[3] 不錄製{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag3}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
-        print(f"{C_WHITE}選擇 (2-3) [2]：{RESET}", end=" ")
-        default_choice = "2"
+        print(f"{C_WHITE}選擇 (2-3) [3]：{RESET}", end=" ")
+        default_choice = "3"
     elif has_aggregate:
-        # 有聚集但沒 Loopback（少見），[2] 不可選，預設 [1]
+        # 有聚集但沒 Loopback（少見），[2] 不可選，預設 [3] 不錄製
         _tag1 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "1" else ""
         _tag3 = f"  {C_OK}{REVERSE} 前次使用 {RESET}" if _last_rec == "3" else ""
-        print(f"  {C_HIGHLIGHT}{BOLD}[1] {_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag1}")
+        print(f"  {C_DIM}[1]{RESET} {C_WHITE}{_rec_label1}{RESET} {C_DIM}{aggregate_name}{RESET}{_tag1}")
         print(f"  {C_DIM}[2] {_rec_label2}  未偵測到 {_LOOPBACK_LABEL}{RESET}")
-        print(f"  {C_DIM}[3]{RESET} {C_WHITE}不錄製{RESET}{_tag3}")
+        print(f"  {C_HIGHLIGHT}{BOLD}[3] 不錄製{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}{_tag3}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
-        print(f"{C_WHITE}選擇 (1,3) [1]：{RESET}", end=" ")
-        default_choice = "1"
+        print(f"{C_WHITE}選擇 (1,3) [3]：{RESET}", end=" ")
+        default_choice = "3"
     else:
         # 都找不到 → fallback 手動選單
         print(f"  {C_HIGHLIGHT}[提醒] 未偵測到聚集裝置或 {_LOOPBACK_LABEL}，請手動選擇錄音裝置{RESET}")
@@ -14398,17 +14394,13 @@ def _ask_record(prefer_mix=False):
         if not input_devices:
             print(f"  {C_DIM}無可用輸入裝置，跳過錄音{RESET}\n")
             return False, None
-        default_id = input_devices[0][0]
 
         print(f"\n  {C_TITLE}{BOLD}錄音裝置{RESET}")
         for dev_id, dev_name, ch, sr in input_devices:
             info = f"{ch}ch {sr}Hz"
-            if dev_id == default_id:
-                print(f"  {C_HIGHLIGHT}{BOLD}[{dev_id}] {dev_name}{RESET} {C_DIM}{info}{RESET}  {C_HIGHLIGHT}{REVERSE} 預設 {RESET}")
-            else:
-                print(f"  {C_DIM}[{dev_id}]{RESET} {C_WHITE}{dev_name}{RESET} {C_DIM}{info}{RESET}")
+            print(f"  {C_DIM}[{dev_id}]{RESET} {C_WHITE}{dev_name}{RESET} {C_DIM}{info}{RESET}")
         print(f"{C_DIM}{'─' * 60}{RESET}")
-        print(f"{C_WHITE}按 Enter 使用預設，或輸入裝置 ID：{RESET}", end=" ")
+        print(f"{C_WHITE}按 Enter 不錄製，或輸入裝置 ID：{RESET}", end=" ")
 
         try:
             dev_input = input().strip()
@@ -14416,13 +14408,16 @@ def _ask_record(prefer_mix=False):
             print()
             sys.exit(0)
 
+        # Enter or an invalid ID means 不錄製 (matches the menu default)
+        selected_id = None
         if dev_input:
             try:
                 selected_id = int(dev_input)
             except ValueError:
-                selected_id = default_id
-        else:
-            selected_id = default_id
+                pass
+        if selected_id is None:
+            print(f"  {C_OK}→ 不錄製{RESET}\n")
+            return False, None
 
         selected_name = next((n for i, n, _, _ in input_devices if i == selected_id),
                              f"裝置 #{selected_id}")
@@ -14457,19 +14452,12 @@ def _ask_record(prefer_mix=False):
             save_config(_config)
         return False, None
     else:
-        # 無效輸入 → 使用預設
-        if default_choice == "1":
-            print(f"  {C_OK}→ 混合錄製 [{aggregate_id}] {aggregate_name}{RESET}\n")
-            if _last_rec != "1":
-                _config["last_rec_choice"] = "1"
-                save_config(_config)
-            return True, aggregate_id
-        else:
-            print(f"  {C_OK}→ 僅錄播放聲音 [{loopback_id}] {loopback_name}{RESET}\n")
-            if _last_rec != "2":
-                _config["last_rec_choice"] = "2"
-                save_config(_config)
-            return True, loopback_id
+        # invalid input -> fall back to the default 不錄製
+        print(f"  {C_OK}→ 不錄製{RESET}\n")
+        if _last_rec != "3":
+            _config["last_rec_choice"] = "3"
+            save_config(_config)
+        return False, None
 
 
 def _ask_topic(record_only=False):
@@ -21300,7 +21288,7 @@ def main():
                 meeting_topic = _ask_topic()
 
             # 詢問是否錄音（自動偵測錄音裝置）
-            record, rec_device = _ask_record(prefer_mix=_early_mic)
+            record, rec_device = _ask_record()
 
             # 詢問是否同時轉錄麥克風
             use_mic = False

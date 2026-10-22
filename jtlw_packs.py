@@ -1,12 +1,13 @@
-"""On-demand download packs for the AppImage build (packaging/appimage/).
+"""On-demand download packs for the portable builds (Linux AppImage in
+packaging/appimage/, Windows portable ZIP in packaging/windows/).
 
 Normal installs (repo venv etc.) import every module directly, so
 ensure_pack() succeeds immediately and nothing is ever downloaded. In
-AppImage mode (JTLW_APPIMAGE=1 and a packs/ spec next to this file) a
-missing pack is pip-installed with --no-deps --target into the user packs
-dir, dependency packs first, then added to sys.path.
+portable mode (JTLW_APPIMAGE=1 or JTLW_PORTABLE=1, and a packs/ spec next to
+this file) a missing pack is pip-installed with --no-deps --target into the
+user packs dir, dependency packs first, then added to sys.path.
 
-CLI (used by AppRun --install-pack):
+CLI (used by --install-pack of AppRun and the Windows launcher):
     python jtlw_packs.py install <pack|all>
 """
 import glob
@@ -15,6 +16,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,8 +34,10 @@ _FALLBACK_ORDER = ["gpu", "ml", "overlay", "argos", "moonshine"]
 _spec_cache = {}
 
 
-def is_appimage():
-    return os.environ.get("JTLW_APPIMAGE") == "1"
+def is_portable():
+    """AppImage (JTLW_APPIMAGE=1) or Windows portable ZIP (JTLW_PORTABLE=1)"""
+    return (os.environ.get("JTLW_APPIMAGE") == "1"
+            or os.environ.get("JTLW_PORTABLE") == "1")
 
 
 def _spec_dir():
@@ -68,8 +72,12 @@ def pack_size_mb(name):
 def packs_dir():
     root = os.environ.get("JTLW_PACKS_DIR")
     if not root:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
-            "~/.local/share")
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
+                r"~\AppData\Local")
+        else:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+                "~/.local/share")
         root = os.path.join(base, "jt-live-whisper", "packs")
     return root
 
@@ -92,18 +100,21 @@ def _add_to_path(target):
         importlib.invalidate_caches()
 
 
-def _appimage_hint():
-    path = (os.environ.get("APPIMAGE") or os.environ.get("JTLW_START_CMD")
+def _install_pack_hint():
+    # JTLW_START_CMD: the AppImage (AppRun) or jt-live-whisper.cmd (Windows)
+    path = (os.environ.get("JTLW_START_CMD") or os.environ.get("APPIMAGE")
             or sys.argv[0])
+    if os.name == "nt" and re.search(r"[\s&()\[\]{}^=;!'+,`~|<>]", path):
+        path = f'"{path}"'  # cmd.exe quoting
     return f"{path} --install-pack"
 
 
 def ensure_pack(name, reason=""):
-    """Make modules of pack `name` importable; download it in AppImage mode.
+    """Make modules of pack `name` importable; download it in portable mode.
 
     Returns True when the pack's modules are available (normal installs take
     this path via the import test and never touch the network). Returns False
-    outside AppImage mode (or on failure) so callers keep today's messages.
+    outside portable mode (or on failure) so callers keep today's messages.
     """
     spec = _load_spec()
     if spec is None:
@@ -118,7 +129,7 @@ def ensure_pack(name, reason=""):
     imports = info.get("imports") or DEFAULT_IMPORTS.get(name, [name])
     if all(_importable(m) for m in imports):
         return True
-    if not is_appimage():
+    if not is_portable():
         return False
 
     for dep in info.get("depends", []):
@@ -145,11 +156,12 @@ def ensure_pack(name, reason=""):
            "--disable-pip-version-check", "--no-deps",
            "--target", target, "-r", pins]
     if info.get("pip_index"):
-        cmd += ["--index-url", info["pip_index"]]
+        # extra index (e.g. PyTorch CUDA wheels); the rest stays on PyPI
+        cmd += ["--extra-index-url", info["pip_index"]]
     shutil.rmtree(target, ignore_errors=True)
     if subprocess.run(cmd).returncode != 0:
         print(f"[錯誤] {name} 套件下載失敗，請檢查網路後重試", file=sys.stderr)
-        print(f"  亦可稍後手動安裝：{_appimage_hint()} {name}", file=sys.stderr)
+        print(f"  亦可稍後手動安裝：{_install_pack_hint()} {name}", file=sys.stderr)
         return False
     for old in glob.glob(os.path.join(target, ".jtlw-complete-*")):
         os.remove(old)

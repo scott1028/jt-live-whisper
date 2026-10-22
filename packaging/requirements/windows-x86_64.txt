@@ -1,0 +1,43 @@
+# Windows x86-64 package list for the portable ZIP (CPython 3.12.13; used by
+# packaging/windows/build-windows.py on the Windows runner).
+# Unlike the Linux lock (full `pip freeze --all` of the dev venv) this pins only
+# the top-level packages of install.ps1 to the Linux lock's versions; their
+# dependencies resolve on the runner. Windows-only differences:
+#   torch 2.11.0+cu128 from the PyTorch cu128 index: PyPI's Windows torch is
+#     CPU-only; the cu128 wheel bundles CUDA in torch\lib (driver >= 570)
+#   nvidia-cublas-cu12 + nvidia-cudnn-cu12: CUDA 12 cuBLAS + cuDNN 9 that
+#     CTranslate2 loads on Windows (the gpu pack)
+#   webrtcvad-wheels instead of webrtcvad (prebuilt, no C compiler)
+#   PyAudioWPatch: WASAPI loopback capture of system audio
+#   no py-spy (dev tool) and no Linux-only nvidia-*/cuda-* CUDA 13 wheels
+# resemblyzer is installed separately with --no-deps (as install.ps1 does),
+# so it pulls neither the original webrtcvad nor the old `typing` backport.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+pip==26.2.2
+setuptools==80.10.2
+torch==2.11.0+cu128
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.27.0.42
+webrtcvad-wheels==2.0.14.post1
+numpy==2.5.4
+ctranslate2==4.8.3
+sentencepiece==0.2.2
+faster-whisper==1.2.1
+huggingface_hub==2.2.0
+scipy==1.18.1
+librosa==1.0.0
+spectralcluster==0.2.22
+sounddevice==0.5.6
+noisereduce==3.0.3
+fastapi==0.156.4
+uvicorn==0.54.0
+websockets==17.3
+python-multipart==0.0.32
+PyQt6==6.11.0
+argostranslate==1.11.0
+PyAudioWPatch==0.2.12.9
+opencc-python-reimplemented==0.1.7
+moonshine-voice==0.1.5
+transformers==5.20.2
+soynlp==0.0.493

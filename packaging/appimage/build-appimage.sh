@@ -2,29 +2,49 @@
 # Build the self-contained jt-live-whisper AppImage:
 #   usr/python/                       portable CPython 3.12.13 (uv /
 #                                     python-build-standalone, ships pip)
-#   usr/python/lib/python3.12/site-   repo venv's packages MINUS the on-demand
+#   usr/python/lib/python3.12/site-   $VENV's packages MINUS the on-demand
 #   packages                          pack exclusions (split_packs.py),
 #                                     + sitecustomize.py
 #   usr/lib/                          PortAudio and its deps that are not
 #                                     present on every desktop
 #   app/                              program files (git ls-files minus
 #                                     docs/ images/ packaging/) + packs/ specs
-# Requires: uv, rsync, the repo venv, appimagetool (found via $APPIMAGETOOL,
-# PATH or .tmp/tools/).
+# Requires: uv, rsync, git, appimagetool (found via $APPIMAGETOOL, PATH or
+# .tmp/tools/) and a Python 3.12 venv with all packages installed:
+# VENV=<path>, default $REPO/venv (a clean one: pip install -r
+# packaging/requirements/linux-x86_64.txt).
+# Optional APPIMAGE_RUNTIME=<file>: type2 runtime passed to appimagetool
+# (default: appimagetool downloads the continuous one).
+# Output: dist/jt-live-whisper-<APP_VERSION>-<7-char hash>-linux-x86_64.AppImage
+# Release images are built on CI (ubuntu-22.04) so bundled libs stay glibc 2.35.
 #
 #   JOBS=4 MEM=4G ./build-appimage.sh   (mksquashfs caps; zstd level 15 default)
+#   VENV=.tmp/ci-venv APPIMAGE_RUNTIME=.tmp/tools/runtime-x86_64 ./build-appimage.sh
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 PYVER="3.12.13"
 JOBS="${JOBS:-4}"
 MEM="${MEM:-4G}"
+VENV="${VENV:-$REPO/venv}"
 START_TS=$SECONDS
 
 command -v uv >/dev/null 2>&1 || {
     echo "需要 uv（用来取得可攜式 Python）：https://docs.astral.sh/uv/" >&2; exit 1; }
 command -v rsync >/dev/null 2>&1 || { echo "需要 rsync" >&2; exit 1; }
-[ -x "$REPO/venv/bin/python" ] || { echo "找不到 $REPO/venv" >&2; exit 1; }
+[ -x "$VENV/bin/python" ] || { echo "找不到 $VENV" >&2; exit 1; }
+if [ -n "${APPIMAGE_RUNTIME:-}" ] && [ ! -f "$APPIMAGE_RUNTIME" ]; then
+    echo "找不到 APPIMAGE_RUNTIME 指定的 runtime：$APPIMAGE_RUNTIME" >&2; exit 1
+fi
+
+# release name: <APP_VERSION>-<7-char commit hash>
+VERSION="$(sed -n 's/^APP_VERSION = "\([^"]*\)".*/\1/p' "$REPO/translate_meeting.py" | head -1)"
+[ -n "$VERSION" ] || {
+    echo "讀不到 translate_meeting.py 的 APP_VERSION" >&2; exit 1; }
+# first 7 of the full sha: --short can grow when ambiguous, and must match CI
+HASH="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+HASH="${HASH:0:7}"
+[ -n "$HASH" ] || { echo "取不到 git commit hash（$REPO 不是 git repo？）" >&2; exit 1; }
 
 # find appimagetool: $APPIMAGETOOL -> PATH -> .tmp/tools/ (download location)
 TOOL=""
@@ -55,18 +75,24 @@ cp -a "$PYDIR/." "$APPDIR/usr/python/"
 
 # ── 2. site-packages = venv minus pack exclusions ──────────────────────────
 echo "[2/6] 複製 site-packages（扣除選用套件包）..."
-"$REPO/venv/bin/python" "$HERE/split_packs.py" >/dev/null
+"$VENV/bin/python" "$HERE/split_packs.py" >/dev/null
 SP="$APPDIR/usr/python/lib/python3.12/site-packages"
+# start empty: the base Python's own pip must not mix with the venv's
+rm -rf "$SP"
 mkdir -p "$SP"
+# leading "/" anchors each exclude.txt path to site-packages (unanchored,
+# "typing.py" would also drop websockets/typing.py)
 rsync -a -m --exclude='__pycache__/' \
-      --exclude-from="$HERE/packs/exclude.txt" \
-      "$REPO/venv/lib/python3.12/site-packages/" "$SP/"
+      --exclude-from=<(sed 's|^|/|' "$HERE/packs/exclude.txt") \
+      "$VENV/lib/python3.12/site-packages/" "$SP/"
 for m in torch PyQt6 nvidia triton spacy moonshine_voice; do
     if [ -e "$SP/$m" ]; then
         echo "打包失敗：$m 不應出現在 AppImage 裡" >&2; exit 1
     fi
 done
 echo "      torch/PyQt6/nvidia/triton/spacy/moonshine_voice 均已排除 ✓"
+"$VENV/bin/python" "$REPO/packaging/check_site.py" \
+    "$VENV/lib/python3.12/site-packages" "$SP" "$HERE/packs/exclude.txt"
 
 # ── 3. sitecustomize + pip sanity ──────────────────────────────────────────
 echo "[3/6] sitecustomize.py 與 pip..."
@@ -93,6 +119,19 @@ while read -r so path; do
     cp -aL "$path" "$APPDIR/usr/lib/"
     echo "      $so"
 done
+# portability: newest GLIBC symbol version the bundled libs need
+if command -v objdump >/dev/null 2>&1; then
+    GLIBC_MAX="$(for f in "$APPDIR"/usr/lib/*; do objdump -T "$f" 2>/dev/null; done \
+        | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)"
+    echo "      usr/lib/ 需要的最高 glibc：GLIBC_${GLIBC_MAX:-?}"
+    if [ -n "$GLIBC_MAX" ] && \
+       [ "$(printf '%s\n' 2.35 "$GLIBC_MAX" | sort -V | tail -1)" != 2.35 ]; then
+        echo "[警告] usr/lib/ 的函式庫需要 GLIBC_$GLIBC_MAX（高於 2.35）：這次打包只能在較新的發行版執行。" >&2
+        echo "       發佈用的版本請在 CI 的 ubuntu-22.04 runner 打包。" >&2
+    fi
+else
+    echo "      略過 glibc 檢查（找不到 objdump，需要 binutils）"
+fi
 
 # ── 5. app/ (program files + pack specs) ───────────────────────────────────
 echo "[5/6] 程式檔與 packs/ 清單..."
@@ -108,7 +147,15 @@ mkdir -p "$APPDIR/app"
 # new modules may still be untracked - include explicitly
 cp "$REPO/jtlw_packs.py" "$APPDIR/app/"
 mkdir -p "$APPDIR/app/packs"
-cp "$HERE"/packs/*.txt "$HERE"/packs/packs.json "$APPDIR/app/packs/"
+# ship packs.json + one pin list per pack in its "order" (exclude.txt is
+# build-time only)
+cp "$HERE/packs/packs.json" "$APPDIR/app/packs/"
+PACK_NAMES="$("$APPDIR/usr/python/bin/python3.12" -c \
+    'import json, sys; print(" ".join(json.load(open(sys.argv[1]))["order"]))' \
+    "$HERE/packs/packs.json")"
+for p in $PACK_NAMES; do
+    cp "$HERE/packs/$p.txt" "$APPDIR/app/packs/"
+done
 for f in translate_meeting.py webui.py subtitle_overlay.py jtlw_packs.py \
          packs/packs.json; do
     [ -f "$APPDIR/app/$f" ] || { echo "打包失敗：app/$f 缺失" >&2; exit 1; }
@@ -123,11 +170,15 @@ cp "$REPO/icons/jt-live-whisper.png" "$APPDIR/.DirIcon"
 chmod +x "$APPDIR/AppRun" "$APPDIR/jt-live-whisper.desktop"
 
 mkdir -p "$REPO/dist"
-OUT="$REPO/dist/jt-live-whisper-x86_64.AppImage"
+OUT="$REPO/dist/jt-live-whisper-$VERSION-$HASH-linux-x86_64.AppImage"
 rm -f "$OUT"
 # -n: no update information (local build); -processors/-mem cap memory use
 # (mksquashfs' zstd default compression level 15 is used as-is)
-ARCH=x86_64 "$TOOL" -n --comp zstd \
+RUNTIME_OPT=()
+if [ -n "${APPIMAGE_RUNTIME:-}" ]; then
+    RUNTIME_OPT=(--runtime-file "$APPIMAGE_RUNTIME")
+fi
+ARCH=x86_64 "$TOOL" -n --comp zstd "${RUNTIME_OPT[@]}" \
     --mksquashfs-opt=-processors --mksquashfs-opt="$JOBS" \
     --mksquashfs-opt=-mem --mksquashfs-opt="$MEM" "$APPDIR" "$OUT"
 

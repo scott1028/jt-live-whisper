@@ -224,9 +224,21 @@ def _win_cuda_candidates():
             list(getattr(site, "getsitepackages", lambda: [])()):
         if p and os.path.isdir(p) and p not in sps:
             sps.append(p)
-    out = [os.path.join(sp, "torch", "lib") for sp in sps]
-    for sp in sps:
-        out += sorted(glob.glob(os.path.join(sp, "nvidia", "*", "bin")))
+    # portable ZIP: completed packs (gpu, ml) are sys.path entries under the
+    # packs root; searched after site-packages
+    pks = []
+    try:
+        from jtlw_packs import packs_dir
+        root = os.path.normcase(os.path.abspath(packs_dir())) + os.sep
+        pks = [p for p in sys.path if p and os.path.isdir(p)
+               and os.path.normcase(os.path.abspath(p)).startswith(root)]
+    except ImportError:
+        pass
+    out = []
+    for group in (sps, pks):
+        out += [os.path.join(sp, "torch", "lib") for sp in group]
+        for sp in group:
+            out += sorted(glob.glob(os.path.join(sp, "nvidia", "*", "bin")))
     for k, v in sorted(os.environ.items()):
         if v and (k.upper() == "CUDA_PATH" or k.upper().startswith("CUDA_PATH_V")):
             out.append(os.path.join(v, "bin"))
@@ -755,16 +767,25 @@ _NLLB_DEFAULT_DIR = _nllb_search_dirs[0] if _nllb_search_dirs else ""
 _LOOPBACK_LABEL = ("WASAPI Loopback" if IS_WINDOWS
                    else "PipeWire / PulseAudio 系統音訊" if IS_LINUX
                    else "BlackHole 2ch")
-# AppImage mode (JTLW_START_CMD set by AppRun): printed 等效指令 shows the
-# AppImage path instead of start.sh
+# Portable mode (JTLW_START_CMD set by AppRun or the Windows launcher):
+# printed 等效指令 shows that path instead of start.sh / start.ps1
 import shlex as _shlex
-_START_CMD = (_shlex.quote(os.environ["JTLW_START_CMD"])
-              if os.environ.get("JTLW_START_CMD")
-              else ".\\start.ps1" if IS_WINDOWS else "./start.sh")
+_START_CMD = os.environ.get("JTLW_START_CMD", "")
+if not _START_CMD:
+    _START_CMD = ".\\start.ps1" if IS_WINDOWS else "./start.sh"
+elif IS_WINDOWS:
+    # cmd.exe quoting (shlex is POSIX-only): double quotes only when needed
+    if re.search(r"[\s&()\[\]{}^=;!'+,`~|<>]", _START_CMD):
+        _START_CMD = f'"{_START_CMD}"'
+else:
+    _START_CMD = _shlex.quote(_START_CMD)
 _INSTALL_CMD = ".\\install.ps1" if IS_WINDOWS else "./install.sh"
 if os.environ.get("JTLW_APPIMAGE") == "1":
     # AppImage has no installer: every installer hint suggests re-download
     _INSTALL_CMD = "重新下載 jt-live-whisper AppImage"
+elif os.environ.get("JTLW_PORTABLE") == "1":
+    # same for the Windows portable ZIP
+    _INSTALL_CMD = "重新下載 jt-live-whisper Windows 可攜版"
 
 
 _overlay_proc_ref = None  # 全域參照，供 _force_exit 使用
@@ -4712,9 +4733,9 @@ def list_audio_devices(model_path):
 def select_asr_engine():
     """讓使用者選擇語音辨識引擎（Moonshine / Whisper）"""
     if not _MOONSHINE_AVAILABLE:
-        from jtlw_packs import is_appimage, pack_size_mb
-        if is_appimage():
-            # AppImage: Moonshine 是選用套件，選了才下載，選單照樣開放
+        from jtlw_packs import is_portable, pack_size_mb
+        if is_portable():
+            # AppImage／Windows 可攜版：Moonshine 是選用套件，選了才下載，選單照樣開放
             size = pack_size_mb("moonshine")
             note = f"，選它會先下載約 {size} MB" if size else "，選它會先下載所需套件"
             print(f"  {C_DIM}(Moonshine 未安裝{note}){RESET}")

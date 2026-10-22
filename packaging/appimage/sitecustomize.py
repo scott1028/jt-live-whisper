@@ -2,6 +2,7 @@
 # only locates libportaudio via ctypes.util.find_library, which fails when
 # the host has no system PortAudio. Only active inside the AppImage (APPDIR
 # set) and when the bundled library exists; a complete no-op otherwise.
+# The Windows portable ZIP ships this file too, for the packs part below.
 import ctypes.util
 import glob
 import os
@@ -22,9 +23,15 @@ if os.environ.get("APPDIR") and os.path.isfile(_BUNDLED):
 
 # Completed on-demand packs (jtlw_packs.py) go on sys.path so subprocesses
 # (overlay, engine) see them too; no-op when the packs dir does not exist.
+# Default root matches jtlw_packs.packs_dir().
+if os.name == "nt":
+    _BASE = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
+        r"~\AppData\Local")
+else:
+    _BASE = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share")
 _PACKS_ROOT = os.environ.get("JTLW_PACKS_DIR") or os.path.join(
-    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
-    "jt-live-whisper", "packs")
+    _BASE, "jt-live-whisper", "packs")
 if os.path.isdir(_PACKS_ROOT):
     for _d in sorted(os.listdir(_PACKS_ROOT)):
         _p = os.path.join(_PACKS_ROOT, _d)

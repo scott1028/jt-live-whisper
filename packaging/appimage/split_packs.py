@@ -26,10 +26,15 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 OUT_DIR = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "packs")
 
+# Windows portable ZIP (packaging/windows/) runs this with its own venv:
+# gpu = nvidia-* (cuBLAS/cuDNN for CTranslate2, no triton) and ml does not
+# need gpu, since the CUDA torch wheel bundles CUDA in torch\lib
+WIN = sys.platform == "win32"
+
 # pack name -> roots (resolved names, normalized); deps = other packs needed
-PACK_DEPS = {"ml": ["gpu"], "argos": ["ml"]}
+PACK_DEPS = {"argos": ["ml"]} if WIN else {"ml": ["gpu"], "argos": ["ml"]}
 PACK_IMPORTS = {
-    "gpu": ["triton"],
+    "gpu": ["nvidia.cublas"] if WIN else ["triton"],
     "ml": ["torch", "transformers", "resemblyzer", "librosa"],
     "overlay": ["PyQt6"],
     "argos": ["argostranslate"],
@@ -56,7 +61,8 @@ CORE_PKGS = ["jtlw_api", "jtlw_tts"]
 # (verified in translate_meeting.py): they belong to their packs, not core
 OPTIONAL_TOPLEVEL = {"moonshine_voice", "argostranslate"}
 
-PIP_INDEX = {}  # pack -> extra pip index URL, or none when PyPI has the wheel
+# ml's pip_index: set only for a CUDA torch from the PyTorch index (version
+# with a +cuXXX local tag); jtlw_packs passes it as --extra-index-url
 PIP_INDEX_NOTE = ("torch 2.14.1 comes from PyPI: its PyPI metadata already "
                   "depends on the CUDA 13 wheels (cuda-toolkit, nvidia-*-cu13,"
                   " triton), so no custom --index-url is needed.")
@@ -171,7 +177,8 @@ def main():
     mod2dist = module_index(dists)
 
     pack_roots = {
-        "gpu": [n for n in dists if n.startswith("nvidia-") or n == "triton"],
+        "gpu": [n for n in dists
+                if n.startswith("nvidia-") or (n == "triton" and not WIN)],
         "ml": ["torch", "transformers", "resemblyzer", "librosa",
                "scikit-learn", "spectralcluster", "numba", "llvmlite"],
         "overlay": ["pyqt6"],
@@ -242,7 +249,15 @@ def main():
 
     # --- outputs ---
     os.makedirs(OUT_DIR, exist_ok=True)
-    spec = {"order": PACK_ORDER, "note_pip_index": PIP_INDEX_NOTE, "packs": {}}
+    pip_index, note = {}, PIP_INDEX_NOTE
+    torch_ver = dists.get("torch", {}).get("version", "")
+    cu = re.search(r"\+(cu\d+)$", torch_ver)
+    if cu:
+        pip_index["ml"] = f"https://download.pytorch.org/whl/{cu.group(1)}"
+        note = (f"torch {torch_ver} is not on PyPI: the ml pack adds "
+                f"{pip_index['ml']} as --extra-index-url; every other "
+                f"package still comes from PyPI.")
+    spec = {"order": PACK_ORDER, "note_pip_index": note, "packs": {}}
     print(f"core: {len(core)} packages stay in the AppImage "
           f"({size_mb(core, dists)} MB)")
     print(f"     {', '.join(sorted(dists[n]['name'] for n in core))}")
@@ -256,7 +271,7 @@ def main():
             "depends": PACK_DEPS.get(p, []),
             "imports": PACK_IMPORTS[p],
             "size_mb": size_mb(pack_excl[p], dists),
-            "pip_index": PIP_INDEX.get(p),
+            "pip_index": pip_index.get(p),
             "packages": len(names),
         }
         print(f"pack {p}: {len(names)} packages, "

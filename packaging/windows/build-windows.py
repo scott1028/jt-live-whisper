@@ -11,7 +11,9 @@ ZIP layout (jt-live-whisper\\ ...):
                                     python-build-standalone) + app-local MSVC
                                     runtime; Lib\\site-packages = venv packages
                                     MINUS the on-demand pack exclusions
-                                    (split_packs.py) + sitecustomize.py
+                                    (split_packs.py) + sitecustomize.py;
+                                    python\\.jtlw-complete is the ZIP's last
+                                    entry (launcher: extraction finished)
   app\\                              program files (git ls-files minus docs/
                                     images/ packaging/) + packs\\ specs
 Output: dist\\jt-live-whisper-<APP_VERSION>-<7-char hash>-windows-x86_64.zip
@@ -223,6 +225,8 @@ def write_zip(folder, out):
             for fn in sorted(filenames):
                 full = os.path.join(dirpath, fn)
                 zf.write(full, os.path.relpath(full, base))
+        # written last: exists only when extraction finished (launcher checks)
+        zf.writestr(os.path.basename(folder) + "/python/.jtlw-complete", "")
 
 
 def main():

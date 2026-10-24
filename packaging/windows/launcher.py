@@ -99,6 +99,13 @@ def main(argv):
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+    # build-windows.py writes this as the ZIP's last entry
+    if not os.path.isfile(os.path.join(HERE, "python", ".jtlw-complete")):
+        print("[錯誤] ZIP 沒有完整解壓縮，部分檔案缺少，程式無法執行。\n"
+              "請用檔案總管「全部解壓縮」或 7-Zip 重新把整個 ZIP 解壓到同一個位置\n"
+              f"（{os.path.dirname(HERE)}），讓 ZIP 裡的 jt-live-whisper 資料夾"
+              f"覆蓋\n{HERE} 的現有檔案，等解壓完成後再執行。", file=sys.stderr)
+        return 1
     root = get_data_root()
     packs = os.path.join(root, "packs")
     os.makedirs(packs, exist_ok=True)
